@@ -1,0 +1,16 @@
+﻿{
+  "name": "quran-live-class-server",
+  "version": "1.0.0",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "mediasoup": "^3.16.2",
+    "socket.io": "^4.8.1"
+  }
+}
