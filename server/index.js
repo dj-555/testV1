@@ -68,6 +68,10 @@ async function bootstrap() {
     res.json(room.getActiveStudentState());
   });
 
+  app.get('/queue', (req, res) => {
+    res.json(room.getQueueState());
+  });
+
   io.on('connection', (socket) => {
     log('socket connected', {
       socketId: socket.id,
@@ -180,6 +184,28 @@ async function bootstrap() {
         ackOk(ack, data);
       } catch (error) {
         log('endTurn error', { socketId: socket.id, error: error.message });
+        ackError(ack, error);
+      }
+    });
+
+    socket.on('joinQueue', async (payload = {}, ack) => {
+      log('joinQueue', { socketId: socket.id, payload });
+      try {
+        const data = await room.joinQueue(socket.id);
+        ackOk(ack, data);
+      } catch (error) {
+        log('joinQueue error', { socketId: socket.id, error: error.message });
+        ackError(ack, error);
+      }
+    });
+
+    socket.on('leaveQueue', async (payload = {}, ack) => {
+      log('leaveQueue', { socketId: socket.id, payload });
+      try {
+        const data = await room.leaveQueue(socket.id);
+        ackOk(ack, data);
+      } catch (error) {
+        log('leaveQueue error', { socketId: socket.id, error: error.message });
         ackError(ack, error);
       }
     });
