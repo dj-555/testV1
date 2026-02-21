@@ -11,13 +11,13 @@ void main() {
 }
 
 class QuranLiveClassApp extends StatelessWidget {
-  const QuranLiveClassApp({super.key});
+    const QuranLiveClassApp({super.key});
 
-  @override
-  Widget build(BuildContext context) {
-    return MaterialApp(
-      debugShowCheckedModeBanner: false,
-      title: 'Quran Live Class',
+    @override
+    Widget build(BuildContext context) {
+      return MaterialApp(
+        debugShowCheckedModeBanner: false,
+        title: 'Quran Live Class',
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.teal),
         useMaterial3: true,
@@ -36,7 +36,7 @@ class QuranLiveClassPage extends StatefulWidget {
 
 class _QuranLiveClassPageState extends State<QuranLiveClassPage> {
   final TextEditingController _serverController =
-      TextEditingController(text: 'http://192.168.1.194:3000');
+      TextEditingController(text: 'http://192.168.1.188:3000');
   final TextEditingController _nameController =
       TextEditingController(text: 'Teacher');
 
@@ -188,6 +188,11 @@ class _QuranLiveClassPageState extends State<QuranLiveClassPage> {
         .removeListener(_onActiveStudentStreamChanged);
     _client.peersNotifier.removeListener(_onPeersChanged);
     _client.activeStudentIdNotifier.removeListener(_onActiveStudentChanged);
+    if (_renderersReady) {
+      _localRenderer.srcObject = null;
+      _teacherRenderer.srcObject = null;
+      _activeStudentRenderer.srcObject = null;
+    }
     unawaited(_client.dispose());
     unawaited(_localRenderer.dispose());
     unawaited(_teacherRenderer.dispose());

@@ -405,6 +405,7 @@ class WebRtcClient {
       _sendTransport!.produce(
         track: audioTracks.first,
         stream: _localStream!,
+        stopTracks: false,
         source: 'microphone',
       );
     }
@@ -414,6 +415,7 @@ class WebRtcClient {
       _sendTransport!.produce(
         track: videoTracks.first,
         stream: _localStream!,
+        stopTracks: false,
         source: 'webcam',
       );
     }
@@ -503,6 +505,8 @@ class WebRtcClient {
       }
     }
 
+    teacherRemoteStreamNotifier.value = null;
+    activeStudentRemoteStreamNotifier.value = null;
     await _disposeRemoteStreams();
 
     if (teacherConsumers.isNotEmpty) {
@@ -548,7 +552,7 @@ class WebRtcClient {
       final consumer = _consumersByProducerId.remove(producerId);
       if (consumer != null) {
         _consumersById.remove(consumer.id);
-        consumer.close();
+        await consumer.close();
         await _rebuildRemoteStreams();
       }
 
@@ -563,7 +567,7 @@ class WebRtcClient {
       final consumer = _consumersById.remove(consumerId);
       if (consumer != null) {
         _consumersByProducerId.remove(consumer.producerId);
-        consumer.close();
+        await consumer.close();
         await _rebuildRemoteStreams();
       }
 
@@ -647,28 +651,29 @@ class WebRtcClient {
     _localProducersByKind.clear();
 
     if (_localStream != null) {
-      for (final track in _localStream!.getTracks()) {
-        track.stop();
-      }
-      await _localStream!.dispose();
+      final localStream = _localStream!;
       _localStream = null;
       localStreamNotifier.value = null;
+      try {
+        await localStream.dispose();
+      } catch (error) {
+        debugPrint('[webrtc] local stream dispose failed: $error');
+      }
     }
   }
 
   Future<void> _closeConsumers() async {
     final consumers = _consumersById.values.toList(growable: false);
-    for (final consumer in consumers) {
-      consumer.close();
-    }
-
     _consumersById.clear();
     _consumersByProducerId.clear();
 
-    await _disposeRemoteStreams();
-
     teacherRemoteStreamNotifier.value = null;
     activeStudentRemoteStreamNotifier.value = null;
+    await _disposeRemoteStreams();
+
+    for (final consumer in consumers) {
+      await consumer.close();
+    }
   }
 
   Future<void> _closeTransports() async {
@@ -681,12 +686,20 @@ class WebRtcClient {
 
   Future<void> _disposeRemoteStreams() async {
     if (_teacherRemoteStream != null) {
-      await _teacherRemoteStream!.dispose();
+      try {
+        await _teacherRemoteStream!.dispose();
+      } catch (error) {
+        debugPrint('[webrtc] teacher remote stream dispose failed: $error');
+      }
       _teacherRemoteStream = null;
     }
 
     if (_activeStudentRemoteStream != null) {
-      await _activeStudentRemoteStream!.dispose();
+      try {
+        await _activeStudentRemoteStream!.dispose();
+      } catch (error) {
+        debugPrint('[webrtc] active student stream dispose failed: $error');
+      }
       _activeStudentRemoteStream = null;
     }
   }
