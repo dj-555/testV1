@@ -789,8 +789,16 @@ class WebRtcClient {
 
       if (_role != 'student') return;
 
-      await _stopLocalMediaAndProducers(notifyServer: false);
-      await _closeSendTransportOnly();
+      try {
+        await _stopLocalMediaAndProducers(notifyServer: false);
+        await _closeSendTransportOnly();
+        await _recoverStudentWatchStreams(reason: 'turnEnded');
+        unawaited(
+          _recoverStudentWatchStreamsDelayed(reason: 'turnEnded-delayed'),
+        );
+      } catch (error) {
+        debugPrint('[webrtc] turnEnded cleanup failed: $error');
+      }
     });
 
     _signaling.on('peersUpdate', (dynamic data) async {
@@ -826,6 +834,14 @@ class WebRtcClient {
       if (_role == 'teacher') {
         await _ensureActiveStudentConsumers();
       }
+      if (_role == 'student') {
+        await _recoverStudentWatchStreams(reason: 'activeStudentChanged');
+        unawaited(
+          _recoverStudentWatchStreamsDelayed(
+            reason: 'activeStudentChanged-delayed',
+          ),
+        );
+      }
       debugPrint(
           '[webrtc] activeStudentChanged=${activeStudentIdNotifier.value}');
     });
@@ -834,7 +850,7 @@ class WebRtcClient {
       debugPrint('[webrtc] teacherDisconnected payload=${_toMap(data)}');
     });
 
-    _signaling.on('queueUpdate', (dynamic data) {
+    _signaling.on('queueUpdate', (dynamic data) async {
       final payload = _toMap(data);
       final hasQueuePayload = _updateQueue(payload['queue']);
       if (!hasQueuePayload) {
@@ -842,6 +858,9 @@ class WebRtcClient {
       }
       if (payload['activeStudentId'] != null) {
         activeStudentIdNotifier.value = payload['activeStudentId']?.toString();
+        if (_role == 'student') {
+          await _recoverStudentWatchStreams(reason: 'queueUpdate');
+        }
       }
     });
   }
@@ -949,6 +968,29 @@ class WebRtcClient {
     } catch (error) {
       debugPrint('[webrtc] delayed teacher stream recovery failed: $error');
     }
+  }
+
+  Future<void> _recoverStudentWatchStreams({
+    required String reason,
+  }) async {
+    if (_role != 'student') {
+      return;
+    }
+
+    try {
+      await _ensureTeacherConsumers();
+      await _rebuildRemoteStreams();
+    } catch (error) {
+      debugPrint(
+          '[webrtc] recoverStudentWatchStreams failed ($reason): $error');
+    }
+  }
+
+  Future<void> _recoverStudentWatchStreamsDelayed({
+    required String reason,
+  }) async {
+    await Future<void>.delayed(const Duration(milliseconds: 800));
+    await _recoverStudentWatchStreams(reason: reason);
   }
 
   Future<void> _stopLocalMediaAndProducers({required bool notifyServer}) async {
