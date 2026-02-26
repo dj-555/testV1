@@ -20,17 +20,35 @@ async function createMediasoupWorkerAndRouter() {
     log('Worker died, exiting in 2 seconds...');
     setTimeout(() => process.exit(1), 2000);
   });
+  worker.on('subprocessclose', () => {
+    log('Worker subprocess closed');
+  });
 
   router = await worker.createRouter(config.mediasoup.router);
 
   log(`Worker created (pid=${worker.pid})`);
   log('Router created with codecs', config.mediasoup.router.mediaCodecs.map((c) => c.mimeType));
+  log('mediasoup worker/network settings', {
+    rtcMinPort: config.mediasoup.worker.rtcMinPort,
+    rtcMaxPort: config.mediasoup.worker.rtcMaxPort,
+    listenIps: config.mediasoup.webRtcTransport.listenIps
+  });
 
   return { worker, router };
 }
 
 async function createWebRtcTransport(routerInstance) {
   const transport = await routerInstance.createWebRtcTransport(config.mediasoup.webRtcTransport);
+  if (config.debugLogs) {
+    log('WebRtcTransport created', {
+      transportId: transport.id,
+      iceCandidates: transport.iceCandidates.map((candidate) => ({
+        protocol: candidate.protocol,
+        ip: candidate.ip,
+        port: candidate.port
+      }))
+    });
+  }
 
   if (config.mediasoup.webRtcTransport.maxIncomingBitrate) {
     try {
