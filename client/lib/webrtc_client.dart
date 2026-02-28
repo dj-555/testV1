@@ -30,6 +30,23 @@ class PeerSummary {
   }
 }
 
+class QueueEntry {
+  final String id;
+  final String name;
+
+  const QueueEntry({
+    required this.id,
+    required this.name,
+  });
+
+  factory QueueEntry.fromMap(Map<String, dynamic> map) {
+    return QueueEntry(
+      id: map['id']?.toString() ?? '',
+      name: map['name']?.toString() ?? 'Student',
+    );
+  }
+}
+
 class WebRtcClient {
   final SignalingClient _signaling;
 
@@ -62,6 +79,8 @@ class WebRtcClient {
       ValueNotifier<List<PeerSummary>>(<PeerSummary>[]);
   final ValueNotifier<String?> activeStudentIdNotifier =
       ValueNotifier<String?>(null);
+  final ValueNotifier<List<QueueEntry>> queueNotifier =
+      ValueNotifier<List<QueueEntry>>(<QueueEntry>[]);
 
   String _role = 'student';
   String _displayName = 'Student';
@@ -85,11 +104,17 @@ class WebRtcClient {
   final Map<String, ms.Consumer> _consumersById = <String, ms.Consumer>{};
   final Map<String, ms.Consumer> _consumersByProducerId =
       <String, ms.Consumer>{};
+  final Map<String, Map<String, dynamic>> _consumerMetaById =
+      <String, Map<String, dynamic>>{};
+  final Map<String, Map<String, dynamic>> _producerMetaById =
+      <String, Map<String, dynamic>>{};
 
   StreamSubscription<int>? _reconnectSub;
   StreamSubscription<String>? _disconnectSub;
+  Future<void> _rebuildRemoteStreamsQueue = Future<void>.value();
 
   bool get isTeacher => _role == 'teacher';
+  String? get peerId => _peerId;
 
   Future<void> connect({
     required String serverUrl,
@@ -147,18 +172,21 @@ class WebRtcClient {
     activeStudentRemoteStreamNotifier.dispose();
     peersNotifier.dispose();
     activeStudentIdNotifier.dispose();
+    queueNotifier.dispose();
   }
 
-  Future<void> approveTurn(String studentId) async {
+  Future<void> approveTurn([String? studentId]) async {
     if (!isTeacher) {
       throw Exception('Only teacher can approve turns');
     }
 
-    await _signaling.request('approveTurn', <String, dynamic>{
-      'studentId': studentId,
-    });
+    final payload = <String, dynamic>{};
+    if (studentId != null && studentId.isNotEmpty) {
+      payload['studentId'] = studentId;
+    }
+    await _signaling.request('approveTurn', payload);
 
-    debugPrint('[webrtc] approveTurn -> $studentId');
+    debugPrint('[webrtc] approveTurn -> ${studentId ?? 'first_in_queue'}');
   }
 
   Future<void> endTurn() async {
@@ -171,6 +199,20 @@ class WebRtcClient {
     });
 
     debugPrint('[webrtc] endTurn sent');
+  }
+
+  Future<void> joinQueue() async {
+    if (isTeacher) {
+      throw Exception('Teacher does not join queue');
+    }
+    await _signaling.request('joinQueue');
+  }
+
+  Future<void> leaveQueue() async {
+    if (isTeacher) {
+      throw Exception('Teacher does not leave queue');
+    }
+    await _signaling.request('leaveQueue');
   }
 
   Future<void> _handleReconnect() async {
@@ -204,6 +246,11 @@ class WebRtcClient {
     activeStudentIdNotifier.value = joinResponse['activeStudentId']?.toString();
 
     _updatePeers(joinResponse['peers']);
+    _absorbServerProducerState(joinResponse);
+    final hasQueuePayload = _updateQueue(joinResponse['queue']);
+    if (!hasQueuePayload) {
+      _rebuildQueueFromPeers();
+    }
 
     await _createDevice(joinResponse['rtpCapabilities']);
     await _createRecvTransport();
@@ -211,6 +258,7 @@ class WebRtcClient {
     if (isTeacher) {
       await _createSendTransportIfNeeded();
       await _startLocalMediaAndProduce();
+      await _ensureActiveStudentConsumers();
     }
 
     final dynamic producersRaw = joinResponse['producers'];
@@ -218,6 +266,7 @@ class WebRtcClient {
       for (final dynamic item in producersRaw) {
         final producerMap = _toMap(item);
         if (producerMap.isNotEmpty) {
+          _rememberProducerMeta(producerMap);
           await _consumeProducer(producerMap);
         }
       }
@@ -367,14 +416,18 @@ class WebRtcClient {
       throw Exception('Camera/Microphone permission denied');
     }
 
+    final isStudent = _role == 'student';
     final legacyConstraints = <String, dynamic>{
       'audio': true,
       'video': <String, dynamic>{
         'facingMode': 'user',
         'mandatory': <String, dynamic>{
-          'minWidth': '640',
-          'minHeight': '360',
-          'minFrameRate': '15',
+          'minWidth': isStudent ? '320' : '640',
+          'minHeight': isStudent ? '180' : '360',
+          'maxWidth': isStudent ? '320' : '640',
+          'maxHeight': isStudent ? '180' : '360',
+          'minFrameRate': isStudent ? '10' : '15',
+          'maxFrameRate': isStudent ? '12' : '24',
         },
         'optional': <dynamic>[],
       },
@@ -405,6 +458,7 @@ class WebRtcClient {
       _sendTransport!.produce(
         track: audioTracks.first,
         stream: _localStream!,
+        stopTracks: false,
         source: 'microphone',
       );
     }
@@ -414,6 +468,7 @@ class WebRtcClient {
       _sendTransport!.produce(
         track: videoTracks.first,
         stream: _localStream!,
+        stopTracks: false,
         source: 'webcam',
       );
     }
@@ -436,11 +491,30 @@ class WebRtcClient {
   Future<void> _consumeProducer(Map<String, dynamic> producerInfo) async {
     if (_recvTransport == null || _device == null) return;
 
+    _rememberProducerMeta(producerInfo);
+
     final producerId = producerInfo['producerId']?.toString();
     final producerPeerId = producerInfo['peerId']?.toString();
+    final producerRole = _normalizeRole(producerInfo['role']);
+    final producerSource = _normalizeSource(producerInfo['source']);
 
     if (producerId == null || producerPeerId == null) return;
     if (producerPeerId == _peerId) return;
+    final isTeacherProducer =
+        producerSource == 'teacher' || producerRole == 'teacher';
+    final activePeerId = activeStudentIdNotifier.value;
+    final isActiveStudentProducer =
+        producerSource == 'activestudent' || producerRole == 'student';
+    final canStudentConsumeActiveStudent = isActiveStudentProducer &&
+        activePeerId != null &&
+        activePeerId.isNotEmpty &&
+        activePeerId != _peerId &&
+        producerPeerId == activePeerId;
+    if (_role == 'student' &&
+        !isTeacherProducer &&
+        !canStudentConsumeActiveStudent) {
+      return;
+    }
 
     if (_consumersByProducerId.containsKey(producerId)) {
       return;
@@ -453,24 +527,47 @@ class WebRtcClient {
         'rtpCapabilities': _device!.rtpCapabilities.toMap(),
       });
 
+      final consumerId = response['id']?.toString();
+      if (consumerId == null || consumerId.isEmpty) {
+        debugPrint(
+            '[webrtc] consume failed producerId=$producerId error=missing consumer id');
+        return;
+      }
+
+      final responseProducerId = response['producerId']?.toString();
+      final responsePeerId = response['peerId']?.toString();
+      final appData = _normalizeConsumerAppData(
+        _toMap(response['appData']),
+        fallbackProducerId: responseProducerId ?? producerId,
+        fallbackPeerId: responsePeerId ?? producerPeerId,
+        fallbackRole: producerInfo['role']?.toString(),
+        fallbackSource: producerInfo['source']?.toString(),
+      );
+      _rememberProducerMeta(
+        appData,
+        fallbackProducerId: responseProducerId ?? producerId,
+      );
+
+      _consumerMetaById[consumerId] = appData;
+
       final String kind = _normalizeKind(response['kind']);
       final mediaKind = kind == 'audio'
           ? RTCRtpMediaType.RTCRtpMediaTypeAudio
           : RTCRtpMediaType.RTCRtpMediaTypeVideo;
 
       _recvTransport!.consume(
-        id: response['id']?.toString() ?? '',
-        producerId: response['producerId']?.toString() ?? '',
-        peerId: response['peerId']?.toString() ?? '',
+        id: consumerId,
+        producerId: responseProducerId ?? producerId,
+        peerId: responsePeerId ?? producerPeerId,
         kind: mediaKind,
         rtpParameters: ms.RtpParameters.fromMap(
           _toMap(response['rtpParameters']),
         ),
-        appData: _toMap(response['appData']),
+        appData: appData,
       );
 
       await _signaling.request('resumeConsumer', <String, dynamic>{
-        'consumerId': response['id']?.toString() ?? '',
+        'consumerId': consumerId,
       });
 
       debugPrint('[webrtc] consume success producerId=$producerId');
@@ -482,6 +579,14 @@ class WebRtcClient {
   void _onConsumerCreated(ms.Consumer consumer, dynamic _) {
     _consumersById[consumer.id] = consumer;
     _consumersByProducerId[consumer.producerId] = consumer;
+    _consumerMetaById[consumer.id] = _normalizeConsumerAppData(
+      _consumerMetaById[consumer.id] ?? _toMap(consumer.appData),
+      fallbackProducerId: consumer.producerId,
+    );
+    _rememberProducerMeta(
+      _consumerMetaById[consumer.id]!,
+      fallbackProducerId: consumer.producerId,
+    );
 
     debugPrint(
         '[webrtc] consumer created id=${consumer.id} producerId=${consumer.producerId}');
@@ -489,39 +594,126 @@ class WebRtcClient {
     unawaited(_rebuildRemoteStreams());
   }
 
-  Future<void> _rebuildRemoteStreams() async {
+  Future<void> _rebuildRemoteStreams() {
+    _rebuildRemoteStreamsQueue = _rebuildRemoteStreamsQueue.then((_) async {
+      try {
+        await _rebuildRemoteStreamsInternal();
+      } catch (error) {
+        debugPrint('[webrtc] rebuildRemoteStreams failed: $error');
+      }
+    });
+
+    return _rebuildRemoteStreamsQueue;
+  }
+
+  Future<void> _rebuildRemoteStreamsInternal() async {
     final teacherConsumers = <ms.Consumer>[];
     final activeStudentConsumers = <ms.Consumer>[];
+    int unknownConsumers = 0;
 
     for (final consumer in _consumersById.values) {
-      final appData = _toMap(consumer.appData);
-      final role = appData['role']?.toString();
-      if (role == 'teacher') {
+      final appData = _normalizeConsumerAppData(
+        _consumerMetaById[consumer.id] ?? _toMap(consumer.appData),
+        fallbackProducerId: consumer.producerId,
+      );
+      _consumerMetaById[consumer.id] = appData;
+      _rememberProducerMeta(appData, fallbackProducerId: consumer.producerId);
+
+      final producerMeta =
+          _producerMetaById[consumer.producerId] ?? const <String, dynamic>{};
+
+      final source =
+          _normalizeSource(producerMeta['source'] ?? appData['source']);
+      final role = _normalizeRole(producerMeta['role'] ?? appData['role']);
+
+      if (source == 'teacher' || role == 'teacher') {
         teacherConsumers.add(consumer);
-      } else if (role == 'student') {
+      } else if (source == 'activestudent' || role == 'student') {
         activeStudentConsumers.add(consumer);
+      } else {
+        unknownConsumers += 1;
       }
     }
 
-    await _disposeRemoteStreams();
+    final nextTeacherRemoteStream = await _buildRemoteStream(
+      streamId: 'teacher-remote',
+      label: 'teacher',
+      consumers: teacherConsumers,
+    );
+    final nextActiveStudentRemoteStream = await _buildRemoteStream(
+      streamId: 'active-student-remote',
+      label: 'activeStudent',
+      consumers: activeStudentConsumers,
+    );
 
-    if (teacherConsumers.isNotEmpty) {
-      _teacherRemoteStream = await createLocalMediaStream('teacher-remote');
-      for (final consumer in teacherConsumers) {
-        _teacherRemoteStream!.addTrack(consumer.track);
-      }
-    }
+    final previousTeacherRemoteStream = _teacherRemoteStream;
+    final previousActiveStudentRemoteStream = _activeStudentRemoteStream;
 
-    if (activeStudentConsumers.isNotEmpty) {
-      _activeStudentRemoteStream =
-          await createLocalMediaStream('active-student-remote');
-      for (final consumer in activeStudentConsumers) {
-        _activeStudentRemoteStream!.addTrack(consumer.track);
-      }
-    }
+    _teacherRemoteStream = nextTeacherRemoteStream;
+    _activeStudentRemoteStream = nextActiveStudentRemoteStream;
 
     teacherRemoteStreamNotifier.value = _teacherRemoteStream;
     activeStudentRemoteStreamNotifier.value = _activeStudentRemoteStream;
+
+    await _disposeIfDifferent(
+      oldStream: previousTeacherRemoteStream,
+      newStream: _teacherRemoteStream,
+      label: 'teacher',
+    );
+    await _disposeIfDifferent(
+      oldStream: previousActiveStudentRemoteStream,
+      newStream: _activeStudentRemoteStream,
+      label: 'active student',
+    );
+
+    debugPrint(
+        '[webrtc] rebuildRemoteStreams teacher=${teacherConsumers.length} activeStudent=${activeStudentConsumers.length} unknown=$unknownConsumers total=${_consumersById.length}');
+  }
+
+  Future<MediaStream?> _buildRemoteStream({
+    required String streamId,
+    required String label,
+    required List<ms.Consumer> consumers,
+  }) async {
+    if (consumers.isEmpty) {
+      return null;
+    }
+
+    final stream = await createLocalMediaStream(streamId);
+    int attachedTracks = 0;
+
+    for (final consumer in consumers) {
+      try {
+        stream.addTrack(consumer.track);
+        attachedTracks += 1;
+      } catch (error) {
+        debugPrint(
+            '[webrtc] addTrack failed while rebuilding $label stream consumerId=${consumer.id} producerId=${consumer.producerId} error=$error');
+      }
+    }
+
+    if (attachedTracks == 0) {
+      await stream.dispose();
+      return null;
+    }
+
+    return stream;
+  }
+
+  Future<void> _disposeIfDifferent({
+    required MediaStream? oldStream,
+    required MediaStream? newStream,
+    required String label,
+  }) async {
+    if (oldStream == null || identical(oldStream, newStream)) {
+      return;
+    }
+
+    try {
+      await oldStream.dispose();
+    } catch (error) {
+      debugPrint('[webrtc] $label remote stream dispose failed: $error');
+    }
   }
 
   void _registerServerEvents() {
@@ -533,10 +725,12 @@ class WebRtcClient {
     _signaling.off('activeStudentChanged');
     _signaling.off('teacherDisconnected');
     _signaling.off('consumerClosed');
+    _signaling.off('queueUpdate');
 
     _signaling.on('newProducer', (dynamic data) async {
       final payload = _toMap(data);
       debugPrint('[webrtc] newProducer event payload=$payload');
+      _rememberProducerMeta(payload);
       await _consumeProducer(payload);
     });
 
@@ -544,11 +738,13 @@ class WebRtcClient {
       final payload = _toMap(data);
       final producerId = payload['producerId']?.toString();
       if (producerId == null) return;
+      _producerMetaById.remove(producerId);
 
       final consumer = _consumersByProducerId.remove(producerId);
       if (consumer != null) {
         _consumersById.remove(consumer.id);
-        consumer.close();
+        _consumerMetaById.remove(consumer.id);
+        await consumer.close();
         await _rebuildRemoteStreams();
       }
 
@@ -563,7 +759,8 @@ class WebRtcClient {
       final consumer = _consumersById.remove(consumerId);
       if (consumer != null) {
         _consumersByProducerId.remove(consumer.producerId);
-        consumer.close();
+        _consumerMetaById.remove(consumer.id);
+        await consumer.close();
         await _rebuildRemoteStreams();
       }
 
@@ -576,8 +773,12 @@ class WebRtcClient {
       if (_role != 'student') return;
 
       try {
+        await _ensureTeacherConsumers();
         await _createSendTransportIfNeeded();
         await _startLocalMediaAndProduce();
+        await _ensureTeacherConsumers();
+        await _rebuildRemoteStreams();
+        unawaited(_recoverTeacherStreamAfterApproval());
       } catch (error) {
         debugPrint('[webrtc] turnApproved flow failed: $error');
       }
@@ -588,26 +789,79 @@ class WebRtcClient {
 
       if (_role != 'student') return;
 
-      await _stopLocalMediaAndProducers(notifyServer: false);
+      try {
+        await _stopLocalMediaAndProducers(notifyServer: false);
+        await _closeSendTransportOnly();
+        await _recoverStudentWatchStreams(reason: 'turnEnded');
+        unawaited(
+          _recoverStudentWatchStreamsDelayed(reason: 'turnEnded-delayed'),
+        );
+      } catch (error) {
+        debugPrint('[webrtc] turnEnded cleanup failed: $error');
+      }
     });
 
-    _signaling.on('peersUpdate', (dynamic data) {
+    _signaling.on('peersUpdate', (dynamic data) async {
       final payload = _toMap(data);
       _updatePeers(payload['peers']);
       activeStudentIdNotifier.value = payload['activeStudentId']?.toString();
+      _absorbServerProducerState(payload);
+      final hasQueuePayload = _updateQueue(payload['queue']);
+      if (!hasQueuePayload) {
+        _rebuildQueueFromPeers();
+      }
+
+      if (_role == 'student' &&
+          _localStream != null &&
+          activeStudentIdNotifier.value != _peerId) {
+        await _stopLocalMediaAndProducers(notifyServer: false);
+        await _closeSendTransportOnly();
+      }
+      if (_role == 'student') {
+        await _ensureTeacherConsumers();
+        await _rebuildRemoteStreams();
+      }
+      if (_role == 'teacher') {
+        await _ensureActiveStudentConsumers();
+      }
 
       debugPrint('[webrtc] peersUpdate peers=${peersNotifier.value.length}');
     });
 
-    _signaling.on('activeStudentChanged', (dynamic data) {
+    _signaling.on('activeStudentChanged', (dynamic data) async {
       final payload = _toMap(data);
       activeStudentIdNotifier.value = payload['studentId']?.toString();
+      if (_role == 'teacher') {
+        await _ensureActiveStudentConsumers();
+      }
+      if (_role == 'student') {
+        await _recoverStudentWatchStreams(reason: 'activeStudentChanged');
+        unawaited(
+          _recoverStudentWatchStreamsDelayed(
+            reason: 'activeStudentChanged-delayed',
+          ),
+        );
+      }
       debugPrint(
           '[webrtc] activeStudentChanged=${activeStudentIdNotifier.value}');
     });
 
     _signaling.on('teacherDisconnected', (dynamic data) {
       debugPrint('[webrtc] teacherDisconnected payload=${_toMap(data)}');
+    });
+
+    _signaling.on('queueUpdate', (dynamic data) async {
+      final payload = _toMap(data);
+      final hasQueuePayload = _updateQueue(payload['queue']);
+      if (!hasQueuePayload) {
+        _rebuildQueueFromPeers();
+      }
+      if (payload['activeStudentId'] != null) {
+        activeStudentIdNotifier.value = payload['activeStudentId']?.toString();
+        if (_role == 'student') {
+          await _recoverStudentWatchStreams(reason: 'queueUpdate');
+        }
+      }
     });
   }
 
@@ -625,6 +879,118 @@ class WebRtcClient {
     }
 
     peersNotifier.value = parsed;
+  }
+
+  bool _updateQueue(dynamic queueRaw) {
+    if (queueRaw is! List) {
+      return false;
+    }
+
+    final parsed = <QueueEntry>[];
+    for (final dynamic item in queueRaw) {
+      final map = _toMap(item);
+      if (map.isEmpty) {
+        final id = item?.toString() ?? '';
+        if (id.isEmpty) continue;
+        parsed.add(QueueEntry(id: id, name: 'Student'));
+        continue;
+      }
+      final entry = QueueEntry.fromMap(map);
+      if (entry.id.isEmpty) continue;
+      parsed.add(entry);
+    }
+
+    queueNotifier.value = parsed;
+    return true;
+  }
+
+  void _rebuildQueueFromPeers() {
+    final activeStudentId = activeStudentIdNotifier.value;
+    final peersById = <String, PeerSummary>{
+      for (final peer in peersNotifier.value) peer.id: peer,
+    };
+
+    final rebuilt = <QueueEntry>[];
+    final seen = <String>{};
+
+    for (final existing in queueNotifier.value) {
+      final peer = peersById[existing.id];
+      if (peer == null || peer.role != 'student') continue;
+      if (peer.id == activeStudentId) continue;
+      if (!seen.add(peer.id)) continue;
+      rebuilt.add(QueueEntry(id: peer.id, name: peer.name));
+    }
+
+    for (final peer in peersNotifier.value) {
+      if (peer.role != 'student') continue;
+      if (peer.id == activeStudentId) continue;
+      if (!seen.add(peer.id)) continue;
+      rebuilt.add(QueueEntry(id: peer.id, name: peer.name));
+    }
+
+    queueNotifier.value = rebuilt;
+  }
+
+  void _absorbServerProducerState(Map<String, dynamic> payload) {
+    final teacherMap = _toMap(payload['teacherProducers']);
+    for (final key in const <String>['audio', 'video']) {
+      final producerId = teacherMap[key]?.toString();
+      if (producerId == null || producerId.isEmpty) continue;
+      _rememberProducerMeta(<String, dynamic>{
+        'producerId': producerId,
+        'role': 'teacher',
+        'source': 'teacher',
+      });
+    }
+
+    final activeMap = _toMap(payload['activeStudentProducers']);
+    final activePeerId = payload['activeStudentId']?.toString();
+    for (final key in const <String>['audio', 'video']) {
+      final producerId = activeMap[key]?.toString();
+      if (producerId == null || producerId.isEmpty) continue;
+      _rememberProducerMeta(<String, dynamic>{
+        'producerId': producerId,
+        'peerId': activePeerId,
+        'role': 'student',
+        'source': 'activestudent',
+      });
+    }
+  }
+
+  Future<void> _recoverTeacherStreamAfterApproval() async {
+    await Future<void>.delayed(const Duration(milliseconds: 900));
+    if (_role != 'student' || _localStream == null) {
+      return;
+    }
+    try {
+      await _ensureTeacherConsumers();
+      await _rebuildRemoteStreams();
+    } catch (error) {
+      debugPrint('[webrtc] delayed teacher stream recovery failed: $error');
+    }
+  }
+
+  Future<void> _recoverStudentWatchStreams({
+    required String reason,
+  }) async {
+    if (_role != 'student') {
+      return;
+    }
+
+    try {
+      await _ensureTeacherConsumers();
+      await _rebuildRemoteStreams();
+    } catch (error) {
+      debugPrint(
+          '[webrtc] recoverStudentWatchStreams failed ($reason): $error');
+    }
+  }
+
+  Future<void> _recoverStudentWatchStreamsDelayed({
+    required String reason,
+  }) async {
+    await Future<void>.delayed(const Duration(milliseconds: 800));
+    await _recoverStudentWatchStreams(reason: reason);
   }
 
   Future<void> _stopLocalMediaAndProducers({required bool notifyServer}) async {
@@ -647,28 +1013,31 @@ class WebRtcClient {
     _localProducersByKind.clear();
 
     if (_localStream != null) {
-      for (final track in _localStream!.getTracks()) {
-        track.stop();
-      }
-      await _localStream!.dispose();
+      final localStream = _localStream!;
       _localStream = null;
       localStreamNotifier.value = null;
+      try {
+        await localStream.dispose();
+      } catch (error) {
+        debugPrint('[webrtc] local stream dispose failed: $error');
+      }
     }
   }
 
   Future<void> _closeConsumers() async {
     final consumers = _consumersById.values.toList(growable: false);
-    for (final consumer in consumers) {
-      consumer.close();
-    }
-
     _consumersById.clear();
     _consumersByProducerId.clear();
-
-    await _disposeRemoteStreams();
+    _consumerMetaById.clear();
+    _producerMetaById.clear();
 
     teacherRemoteStreamNotifier.value = null;
     activeStudentRemoteStreamNotifier.value = null;
+    await _disposeRemoteStreams();
+
+    for (final consumer in consumers) {
+      await consumer.close();
+    }
   }
 
   Future<void> _closeTransports() async {
@@ -679,14 +1048,81 @@ class WebRtcClient {
     _recvTransport = null;
   }
 
+  Future<void> _closeSendTransportOnly() async {
+    _sendTransport?.close();
+    _sendTransport = null;
+  }
+
+  Future<void> _ensureActiveStudentConsumers() async {
+    if (_recvTransport == null || _device == null || _role != 'teacher') return;
+
+    final activePeerId = activeStudentIdNotifier.value;
+    if (activePeerId == null || activePeerId.isEmpty) {
+      final staleConsumers = <ms.Consumer>[];
+      for (final consumer in _consumersById.values) {
+        final meta = _producerMetaById[consumer.producerId] ??
+            _consumerMetaById[consumer.id] ??
+            const <String, dynamic>{};
+        final source = _normalizeSource(meta['source']);
+        final role = _normalizeRole(meta['role']);
+        if (source == 'activestudent' || role == 'student') {
+          staleConsumers.add(consumer);
+        }
+      }
+      for (final consumer in staleConsumers) {
+        _consumersById.remove(consumer.id);
+        _consumersByProducerId.remove(consumer.producerId);
+        _consumerMetaById.remove(consumer.id);
+        await consumer.close();
+      }
+      await _rebuildRemoteStreams();
+      return;
+    }
+
+    final missingActiveProducerIds = <String>[];
+    for (final entry in _producerMetaById.entries) {
+      final producerId = entry.key;
+      final meta = entry.value;
+      final source = _normalizeSource(meta['source']);
+      final role = _normalizeRole(meta['role']);
+      final peerId = meta['peerId']?.toString();
+      final isActiveStudentProducer =
+          (source == 'activestudent' || role == 'student') &&
+              (peerId == null || peerId.isEmpty || peerId == activePeerId);
+      if (!isActiveStudentProducer) continue;
+      if (_consumersByProducerId.containsKey(producerId)) continue;
+      missingActiveProducerIds.add(producerId);
+    }
+
+    for (final producerId in missingActiveProducerIds) {
+      final meta = _producerMetaById[producerId] ?? const <String, dynamic>{};
+      await _consumeProducer(<String, dynamic>{
+        'producerId': producerId,
+        'peerId': meta['peerId'] ?? activePeerId,
+        'role': 'student',
+        'source': 'activestudent',
+      });
+    }
+
+    await _rebuildRemoteStreams();
+  }
+
   Future<void> _disposeRemoteStreams() async {
     if (_teacherRemoteStream != null) {
-      await _teacherRemoteStream!.dispose();
+      try {
+        await _teacherRemoteStream!.dispose();
+      } catch (error) {
+        debugPrint('[webrtc] teacher remote stream dispose failed: $error');
+      }
       _teacherRemoteStream = null;
     }
 
     if (_activeStudentRemoteStream != null) {
-      await _activeStudentRemoteStream!.dispose();
+      try {
+        await _activeStudentRemoteStream!.dispose();
+      } catch (error) {
+        debugPrint('[webrtc] active student stream dispose failed: $error');
+      }
       _activeStudentRemoteStream = null;
     }
   }
@@ -703,6 +1139,7 @@ class WebRtcClient {
   void _clearStateForUi() {
     peersNotifier.value = <PeerSummary>[];
     activeStudentIdNotifier.value = null;
+    queueNotifier.value = <QueueEntry>[];
 
     localStreamNotifier.value = null;
     teacherRemoteStreamNotifier.value = null;
@@ -716,6 +1153,161 @@ class WebRtcClient {
     return text;
   }
 
+  String _normalizeRole(dynamic role) {
+    final text = role?.toString().toLowerCase() ?? '';
+    if (text.contains('teacher')) return 'teacher';
+    if (text.contains('student')) return 'student';
+    return text;
+  }
+
+  String _normalizeSource(dynamic source) {
+    final text = source?.toString().toLowerCase() ?? '';
+    if (text.contains('teacher')) return 'teacher';
+    if (text.contains('active') && text.contains('student')) {
+      return 'activestudent';
+    }
+    return text.replaceAll(RegExp(r'[^a-z]'), '');
+  }
+
+  Map<String, dynamic> _normalizeConsumerAppData(
+    Map<String, dynamic> appData, {
+    String? fallbackProducerId,
+    String? fallbackPeerId,
+    String? fallbackRole,
+    String? fallbackSource,
+  }) {
+    final normalized = <String, dynamic>{...appData};
+
+    final existingRole = _normalizeRole(normalized['role']);
+    final role =
+        existingRole.isEmpty ? _normalizeRole(fallbackRole) : existingRole;
+    if (role.isNotEmpty) {
+      normalized['role'] = role;
+    }
+
+    final existingSource = _normalizeSource(normalized['source']);
+    String? source;
+    if (existingSource.isNotEmpty) {
+      source = existingSource;
+    } else if (fallbackSource != null && fallbackSource.isNotEmpty) {
+      source = _normalizeSource(fallbackSource);
+    } else if (role == 'teacher') {
+      source = 'teacher';
+    } else if (role == 'student') {
+      source = 'activestudent';
+    }
+
+    if (source != null) {
+      normalized['source'] = source;
+    }
+
+    final producerId = normalized['producerId']?.toString();
+    if ((producerId == null || producerId.isEmpty) &&
+        fallbackProducerId != null &&
+        fallbackProducerId.isNotEmpty) {
+      normalized['producerId'] = fallbackProducerId;
+    }
+
+    final peerId = normalized['peerId']?.toString();
+    if ((peerId == null || peerId.isEmpty) &&
+        fallbackPeerId != null &&
+        fallbackPeerId.isNotEmpty) {
+      normalized['peerId'] = fallbackPeerId;
+    }
+
+    return normalized;
+  }
+
+  void _rememberProducerMeta(
+    Map<String, dynamic> raw, {
+    String? fallbackProducerId,
+  }) {
+    final producerId = raw['producerId']?.toString() ?? fallbackProducerId;
+    if (producerId == null || producerId.isEmpty) return;
+
+    final role = _normalizeRole(raw['role']);
+    String source = _normalizeSource(raw['source']);
+    if (source.isEmpty && role == 'teacher') {
+      source = 'teacher';
+    } else if (source.isEmpty && role == 'student') {
+      source = 'activestudent';
+    }
+
+    final next = <String, dynamic>{
+      'producerId': producerId,
+    };
+
+    final peerId = raw['peerId']?.toString();
+    if (peerId != null && peerId.isNotEmpty) {
+      next['peerId'] = peerId;
+    }
+    if (role.isNotEmpty) {
+      next['role'] = role;
+    }
+    if (source.isNotEmpty) {
+      next['source'] = source;
+    }
+
+    _producerMetaById[producerId] = <String, dynamic>{
+      ...?_producerMetaById[producerId],
+      ...next,
+    };
+  }
+
+  Future<void> _ensureTeacherConsumers() async {
+    if (_recvTransport == null || _device == null) return;
+
+    final missingTeacherProducerIds = <String>[];
+    final missingActiveStudentProducerIds = <String>[];
+    final activePeerId = activeStudentIdNotifier.value;
+
+    for (final entry in _producerMetaById.entries) {
+      final producerId = entry.key;
+      final meta = entry.value;
+      final source = _normalizeSource(meta['source']);
+      final role = _normalizeRole(meta['role']);
+      final peerId = meta['peerId']?.toString();
+      final isTeacher = source == 'teacher' || role == 'teacher';
+      if (_consumersByProducerId.containsKey(producerId)) continue;
+
+      if (isTeacher) {
+        missingTeacherProducerIds.add(producerId);
+        continue;
+      }
+
+      final isActiveStudent = source == 'activestudent' || role == 'student';
+      final shouldConsumeActiveStudent = _role == 'student' &&
+          isActiveStudent &&
+          activePeerId != null &&
+          activePeerId.isNotEmpty &&
+          activePeerId != _peerId &&
+          (peerId == null || peerId.isEmpty || peerId == activePeerId);
+      if (shouldConsumeActiveStudent) {
+        missingActiveStudentProducerIds.add(producerId);
+      }
+    }
+
+    for (final producerId in missingTeacherProducerIds) {
+      final meta = _producerMetaById[producerId] ?? const <String, dynamic>{};
+      await _consumeProducer(<String, dynamic>{
+        'producerId': producerId,
+        'peerId': meta['peerId'],
+        'role': 'teacher',
+        'source': 'teacher',
+      });
+    }
+
+    for (final producerId in missingActiveStudentProducerIds) {
+      final meta = _producerMetaById[producerId] ?? const <String, dynamic>{};
+      await _consumeProducer(<String, dynamic>{
+        'producerId': producerId,
+        'peerId': meta['peerId'] ?? activePeerId,
+        'role': 'student',
+        'source': 'activestudent',
+      });
+    }
+  }
+
   Map<String, dynamic> _toMap(dynamic raw) {
     if (raw is Map) {
       return Map<String, dynamic>.from(raw);
@@ -723,6 +1315,19 @@ class WebRtcClient {
 
     if (raw is List && raw.isNotEmpty && raw.first is Map) {
       return Map<String, dynamic>.from(raw.first as Map);
+    }
+
+    if (raw == null) {
+      return <String, dynamic>{};
+    }
+
+    try {
+      final dynamic converted = raw.toMap();
+      if (converted is Map) {
+        return Map<String, dynamic>.from(converted);
+      }
+    } catch (_) {
+      return <String, dynamic>{};
     }
 
     return <String, dynamic>{};

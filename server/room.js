@@ -13,6 +13,7 @@ class Room {
 
     this.activeStudentId = null;
     this.activeStudentProducers = { audio: null, video: null };
+    this.studentQueue = [];
   }
 
   log(event, payload) {
@@ -75,6 +76,16 @@ class Room {
     this.io.emit('peersUpdate', {
       peers: this.getPeersForClient(),
       teacherId: this.teacherId,
+      activeStudentId: this.activeStudentId,
+      queue: this.getQueueForClient(),
+      teacherProducers: { ...this.teacherProducers },
+      activeStudentProducers: { ...this.activeStudentProducers }
+    });
+  }
+
+  _broadcastQueue() {
+    this.io.emit('queueUpdate', {
+      queue: this.getQueueForClient(),
       activeStudentId: this.activeStudentId
     });
   }
@@ -101,6 +112,75 @@ class Room {
       const normalizedKind = this._normalizeKind(producer.kind);
       this.activeStudentProducers[normalizedKind] = producer.id;
     }
+  }
+
+  _enqueueStudent(peerId) {
+    if (!peerId || this.studentQueue.includes(peerId)) {
+      return;
+    }
+    this.studentQueue.push(peerId);
+  }
+
+  _removeFromQueue(peerId) {
+    const index = this.studentQueue.indexOf(peerId);
+    if (index === -1) {
+      return false;
+    }
+    this.studentQueue.splice(index, 1);
+    return true;
+  }
+
+  getQueueForClient() {
+    const queue = [];
+    for (const peerId of this.studentQueue) {
+      const peer = this.peers.get(peerId);
+      if (!peer || peer.role !== 'student') {
+        continue;
+      }
+      queue.push({
+        id: peer.id,
+        name: peer.name
+      });
+    }
+    return queue;
+  }
+
+  async joinQueue(peerId) {
+    const peer = this._getPeerOrThrow(peerId);
+    if (peer.role !== 'student') {
+      throw new Error('Only students can join queue');
+    }
+
+    peer.wantsQueue = true;
+    if (this.activeStudentId !== peer.id) {
+      this._enqueueStudent(peer.id);
+    }
+
+    this._broadcastPeers();
+    this._broadcastQueue();
+
+    return {
+      queue: this.getQueueForClient(),
+      activeStudentId: this.activeStudentId
+    };
+  }
+
+  async leaveQueue(peerId) {
+    const peer = this._getPeerOrThrow(peerId);
+    if (peer.role !== 'student') {
+      throw new Error('Only students can leave queue');
+    }
+
+    peer.wantsQueue = false;
+    this._removeFromQueue(peer.id);
+
+    this._broadcastPeers();
+    this._broadcastQueue();
+
+    return {
+      queue: this.getQueueForClient(),
+      activeStudentId: this.activeStudentId
+    };
   }
 
   _clearTeacherProducerSlot(kind, producerId) {
@@ -137,7 +217,8 @@ class Room {
       joinedAt: new Date().toISOString(),
       transports: new Map(),
       producers: new Map(),
-      consumers: new Map()
+      consumers: new Map(),
+      wantsQueue: normalizedRole === 'student'
     };
 
     this.peers.set(peer.id, peer);
@@ -145,9 +226,13 @@ class Room {
     if (peer.role === 'teacher') {
       this.teacherId = peer.id;
     }
+    if (peer.role === 'student') {
+      this._enqueueStudent(peer.id);
+    }
 
     this.log('joinRoom', { peerId: peer.id, role: peer.role, name: peer.name });
     this._broadcastPeers();
+    this._broadcastQueue();
 
     return {
       peerId: peer.id,
@@ -157,7 +242,10 @@ class Room {
       peers: this.getPeersForClient(),
       producers: this._getJoinProducers(peer.id),
       teacherId: this.teacherId,
-      activeStudentId: this.activeStudentId
+      activeStudentId: this.activeStudentId,
+      queue: this.getQueueForClient(),
+      teacherProducers: { ...this.teacherProducers },
+      activeStudentProducers: { ...this.activeStudentProducers }
     };
   }
 
@@ -408,37 +496,48 @@ class Room {
   async approveTurn(teacherPeerId, studentId) {
     this._assertTeacher(teacherPeerId);
 
-    const studentPeer = this._getPeerOrThrow(studentId);
+    const requestedStudentId = studentId || this.studentQueue[0];
+    if (!requestedStudentId) {
+      throw new Error('No students waiting in queue');
+    }
+    if (this.studentQueue[0] !== requestedStudentId) {
+      throw new Error('Only the first queued student can be approved');
+    }
+
+    const studentPeer = this._getPeerOrThrow(requestedStudentId);
     if (studentPeer.role !== 'student') {
       throw new Error('approveTurn target must be a student');
     }
 
-    if (this.activeStudentId && this.activeStudentId !== studentId) {
+    if (this.activeStudentId && this.activeStudentId !== requestedStudentId) {
       await this._endActiveTurnInternal('replaced_by_teacher');
     }
 
-    this.activeStudentId = studentId;
+    this.activeStudentId = requestedStudentId;
     this._syncActiveStudentProducerSlots(studentPeer);
+    this._removeFromQueue(requestedStudentId);
 
     studentPeer.socket.emit('turnApproved', {
-      studentId,
+      studentId: requestedStudentId,
       approvedBy: teacherPeerId
     });
 
     this.io.emit('activeStudentChanged', {
-      studentId,
+      studentId: requestedStudentId,
       reason: 'approved'
     });
 
     this._broadcastPeers();
+    this._broadcastQueue();
 
     this.log('approveTurn', {
       teacherPeerId,
-      studentId
+      studentId: requestedStudentId
     });
 
     return {
-      activeStudentId: this.activeStudentId
+      activeStudentId: this.activeStudentId,
+      queue: this.getQueueForClient()
     };
   }
 
@@ -469,6 +568,13 @@ class Room {
         studentId,
         reason
       });
+
+      const shouldRequeue =
+        (reason === 'ended_by_teacher' || reason === 'replaced_by_teacher') &&
+        studentPeer.wantsQueue;
+      if (shouldRequeue) {
+        this._enqueueStudent(studentPeer.id);
+      }
     }
 
     this.io.emit('activeStudentChanged', {
@@ -477,6 +583,7 @@ class Room {
     });
 
     this._broadcastPeers();
+    this._broadcastQueue();
 
     this.log('turnEnded', {
       studentId,
@@ -496,6 +603,7 @@ class Room {
 
     const isTeacher = this.teacherId === peerId;
     const isActiveStudent = this.activeStudentId === peerId;
+    const wasQueued = this._removeFromQueue(peerId);
 
     const producerIds = Array.from(peer.producers.keys());
     for (const producerId of producerIds) {
@@ -536,6 +644,9 @@ class Room {
     }
 
     this._broadcastPeers();
+    if (wasQueued || isActiveStudent) {
+      this._broadcastQueue();
+    }
   }
 
   getHealth() {
@@ -544,6 +655,8 @@ class Room {
       peersCount: this.peers.size,
       teacherId: this.teacherId,
       activeStudentId: this.activeStudentId,
+      queueLength: this.studentQueue.length,
+      queue: this.getQueueForClient(),
       teacherProducers: { ...this.teacherProducers },
       activeStudentProducers: { ...this.activeStudentProducers },
       timestamp: new Date().toISOString()
@@ -573,7 +686,15 @@ class Room {
   getActiveStudentState() {
     return {
       activeStudentId: this.activeStudentId,
-      producers: { ...this.activeStudentProducers }
+      producers: { ...this.activeStudentProducers },
+      queue: this.getQueueForClient()
+    };
+  }
+
+  getQueueState() {
+    return {
+      queue: this.getQueueForClient(),
+      activeStudentId: this.activeStudentId
     };
   }
 }
