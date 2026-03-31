@@ -3,6 +3,8 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:mediasoup_client_flutter/mediasoup_client_flutter.dart' as ms;
+// ignore: implementation_imports
+import 'package:mediasoup_client_flutter/src/handlers/handler_interface.dart' as mshi;
 import 'package:permission_handler/permission_handler.dart';
 
 import 'signaling.dart';
@@ -293,8 +295,36 @@ class WebRtcClient {
       'direction': 'recv',
     });
 
-    _recvTransport = _device!.createRecvTransportFromMap(
-      response,
+    final transportData = _toMap(response);
+    final transportId = transportData['id']?.toString() ?? '';
+    if (transportId.isEmpty) {
+      throw Exception('Invalid recv transport id');
+    }
+
+    _recvTransport = _device!.createRecvTransport(
+      id: transportId,
+      iceParameters: ms.IceParameters.fromMap(
+        _toMap(transportData['iceParameters']),
+      ),
+      iceCandidates: _parseIceCandidates(transportData['iceCandidates']),
+      dtlsParameters: ms.DtlsParameters.fromMap(
+        _toMap(transportData['dtlsParameters']),
+      ),
+      sctpParameters: transportData['sctpParameters'] != null
+          ? ms.SctpParameters.fromMap(_toMap(transportData['sctpParameters']))
+          : null,
+      iceServers: _parseIceServers(transportData['iceServers']),
+      iceTransportPolicy:
+          _parseIceTransportPolicy(transportData['iceTransportPolicy']),
+      appData: _toMap(transportData['appData']),
+      proprietaryConstraints: <String, dynamic>{
+        'optional': <Map<String, dynamic>>[
+          <String, dynamic>{'googDscp': true},
+        ]
+      },
+      additionalSettings: <String, dynamic>{
+        'encodedInsertableStreams': false,
+      },
       consumerCallback: _onConsumerCreated,
     );
 
@@ -317,8 +347,36 @@ class WebRtcClient {
       'direction': 'send',
     });
 
-    _sendTransport = _device!.createSendTransportFromMap(
-      response,
+    final transportData = _toMap(response);
+    final transportId = transportData['id']?.toString() ?? '';
+    if (transportId.isEmpty) {
+      throw Exception('Invalid send transport id');
+    }
+
+    _sendTransport = _device!.createSendTransport(
+      id: transportId,
+      iceParameters: ms.IceParameters.fromMap(
+        _toMap(transportData['iceParameters']),
+      ),
+      iceCandidates: _parseIceCandidates(transportData['iceCandidates']),
+      dtlsParameters: ms.DtlsParameters.fromMap(
+        _toMap(transportData['dtlsParameters']),
+      ),
+      sctpParameters: transportData['sctpParameters'] != null
+          ? ms.SctpParameters.fromMap(_toMap(transportData['sctpParameters']))
+          : null,
+      iceServers: _parseIceServers(transportData['iceServers']),
+      iceTransportPolicy:
+          _parseIceTransportPolicy(transportData['iceTransportPolicy']),
+      appData: _toMap(transportData['appData']),
+      proprietaryConstraints: <String, dynamic>{
+        'optional': <Map<String, dynamic>>[
+          <String, dynamic>{'googDscp': true},
+        ]
+      },
+      additionalSettings: <String, dynamic>{
+        'encodedInsertableStreams': false,
+      },
       producerCallback: _onProducerCreated,
     );
 
@@ -1308,6 +1366,76 @@ class WebRtcClient {
     }
   }
 
+  List<ms.IceCandidate> _parseIceCandidates(dynamic raw) {
+    if (raw is! List) {
+      return <ms.IceCandidate>[];
+    }
+
+    final candidates = <ms.IceCandidate>[];
+    for (final dynamic item in raw) {
+      final map = _toMap(item);
+      if (map.isEmpty) continue;
+      candidates.add(ms.IceCandidate.fromMap(map));
+    }
+
+    return candidates;
+  }
+
+  List<mshi.RTCIceServer> _parseIceServers(dynamic raw) {
+    if (raw is! List) {
+      return <mshi.RTCIceServer>[];
+    }
+
+    final iceServers = <mshi.RTCIceServer>[];
+    for (final dynamic item in raw) {
+      final map = _toMap(item);
+      if (map.isEmpty) continue;
+
+      final urls = _toStringList(map['urls'] ?? map['url']);
+      if (urls.isEmpty) continue;
+
+      final credential = map['credential']?.toString();
+
+      iceServers.add(
+        mshi.RTCIceServer(
+          credentialType: mshi.RTCIceCredentialType.password,
+          username: map['username']?.toString() ?? '',
+          credential:
+              credential != null && credential.isNotEmpty ? credential : null,
+          urls: urls,
+        ),
+      );
+    }
+
+    return iceServers;
+  }
+
+  mshi.RTCIceTransportPolicy? _parseIceTransportPolicy(dynamic raw) {
+    final policy = raw?.toString().trim().toLowerCase() ?? '';
+    if (policy == 'relay') return mshi.RTCIceTransportPolicy.relay;
+    if (policy == 'all') return mshi.RTCIceTransportPolicy.all;
+    return null;
+  }
+
+  List<String> _toStringList(dynamic raw) {
+    if (raw is String) {
+      final value = raw.trim();
+      return value.isEmpty ? <String>[] : <String>[value];
+    }
+
+    if (raw is List) {
+      final values = <String>[];
+      for (final dynamic item in raw) {
+        final value = item?.toString().trim() ?? '';
+        if (value.isEmpty) continue;
+        values.add(value);
+      }
+      return values;
+    }
+
+    return <String>[];
+  }
+
   Map<String, dynamic> _toMap(dynamic raw) {
     if (raw is Map) {
       return Map<String, dynamic>.from(raw);
@@ -1354,3 +1482,4 @@ class WebRtcClient {
     return <String, dynamic>{};
   }
 }
+

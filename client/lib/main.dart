@@ -60,7 +60,7 @@ class _QuranLiveClassPageState extends State<QuranLiveClassPage> {
   static const int _globalQuarterTurnOffset = 2;
 
   final TextEditingController _serverController =
-      TextEditingController(text: 'http://192.168.1.107:3000');
+      TextEditingController(text: 'http://62.171.178.72:3000');
   final TextEditingController _nameController =
       TextEditingController(text: 'Teacher');
 
