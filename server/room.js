@@ -1,4 +1,6 @@
-﻿const { createWebRtcTransport } = require('./mediasoup');
+const crypto = require('crypto');
+const { createWebRtcTransport } = require('./mediasoup');
+const config = require('./config');
 
 class Room {
   constructor({ router, io }) {
@@ -23,6 +25,71 @@ class Room {
       return;
     }
     console.log(`[${timestamp}] [room] ${event}`);
+  }
+
+  _buildTurnCredentials(peerId) {
+    const turn = config.turn || {};
+
+    if (turn.staticAuthSecret && turn.realm) {
+      const nowSec = Math.floor(Date.now() / 1000);
+      const ttlSec = Math.max(Number(turn.credentialTtlSec) || 3600, 60);
+      const username = `${nowSec + ttlSec}:${peerId}`;
+      const credential = crypto
+        .createHmac('sha1', turn.staticAuthSecret)
+        .update(username)
+        .digest('base64');
+
+      return { username, credential };
+    }
+
+    if (turn.username && turn.password) {
+      return {
+        username: String(turn.username),
+        credential: String(turn.password)
+      };
+    }
+
+    return null;
+  }
+
+  _buildIceSettingsForPeer(peerId) {
+    const turn = config.turn || {};
+    const host = String(turn.host || '').trim();
+    const port = Number(turn.port) || 3478;
+    const tlsPort = Number(turn.tlsPort) || 5349;
+    const forceRelay = turn.forceRelay === true;
+
+    const iceServers = [];
+    let hasTurnServer = false;
+
+    if (host) {
+      iceServers.push({
+        urls: [`stun:${host}:${port}`]
+      });
+    }
+
+    if (turn.enabled && host) {
+      const credentials = this._buildTurnCredentials(peerId);
+      if (credentials) {
+        iceServers.push({
+          urls: [
+            `turn:${host}:${port}?transport=udp`,
+            `turn:${host}:${port}?transport=tcp`,
+            `turns:${host}:${tlsPort}?transport=tcp`
+          ],
+          username: credentials.username,
+          credential: credentials.credential
+        });
+        hasTurnServer = true;
+      } else {
+        this.log('TURN is enabled but credentials are missing. Using STUN only.');
+      }
+    }
+
+    return {
+      iceServers,
+      iceTransportPolicy: forceRelay && hasTurnServer ? 'relay' : 'all'
+    };
   }
 
   _normalizeKind(kind) {
@@ -262,20 +329,23 @@ class Room {
       direction
     };
 
-    peer.transports.set(transport.id, transport);
-
+    peer.transports.set(transport.id, transport);
     this.log('createTransport', {
       peerId,
       direction,
       transportId: transport.id
     });
 
+    const iceSettings = this._buildIceSettingsForPeer(peer.id);
+
     return {
       id: transport.id,
       iceParameters: transport.iceParameters,
       iceCandidates: transport.iceCandidates,
       dtlsParameters: transport.dtlsParameters,
-      sctpParameters: transport.sctpParameters
+      sctpParameters: transport.sctpParameters,
+      iceServers: iceSettings.iceServers,
+      iceTransportPolicy: iceSettings.iceTransportPolicy
     };
   }
 
@@ -700,3 +770,4 @@ class Room {
 }
 
 module.exports = Room;
+

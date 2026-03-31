@@ -1,6 +1,32 @@
-﻿const config = {
+function numberFromEnv(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function boolFromEnv(value, fallback = false) {
+  if (value == null) return fallback;
+
+  const normalized = String(value).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+  if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+  return fallback;
+}
+
+const config = {
   httpPort: Number(process.env.PORT || 3000),
   corsOrigin: process.env.CORS_ORIGIN || '*',
+  turn: {
+    enabled: boolFromEnv(process.env.TURN_ENABLED, false),
+    host: process.env.TURN_HOST || process.env.MEDIASOUP_ANNOUNCED_IP || '',
+    port: numberFromEnv(process.env.TURN_PORT, 3478),
+    tlsPort: numberFromEnv(process.env.TURN_TLS_PORT, 5349),
+    username: process.env.TURN_USERNAME || '',
+    password: process.env.TURN_PASSWORD || '',
+    staticAuthSecret: process.env.TURN_STATIC_AUTH_SECRET || '',
+    realm: process.env.TURN_REALM || '',
+    credentialTtlSec: numberFromEnv(process.env.TURN_CREDENTIAL_TTL_SEC, 3600),
+    forceRelay: boolFromEnv(process.env.WEBRTC_FORCE_RELAY, false)
+  },
   mediasoup: {
     worker: {
       rtcMinPort: Number(process.env.MEDIASOUP_MIN_PORT || 20000),
@@ -54,3 +80,4 @@
 };
 
 module.exports = config;
+
