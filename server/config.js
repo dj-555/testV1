@@ -1,3 +1,5 @@
+const path = require('path');
+
 function numberFromEnv(value, fallback) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
@@ -12,9 +14,22 @@ function boolFromEnv(value, fallback = false) {
   return fallback;
 }
 
+function resolvePathFromEnv(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  return path.isAbsolute(raw) ? raw : path.resolve(process.cwd(), raw);
+}
+
 const config = {
   httpPort: Number(process.env.PORT || 3000),
+  httpsPort: numberFromEnv(process.env.HTTPS_PORT, 443),
+  httpsEnabled: boolFromEnv(process.env.HTTPS_ENABLED, false),
+  httpsKeyPath: resolvePathFromEnv(process.env.HTTPS_KEY_PATH),
+  httpsCertPath: resolvePathFromEnv(process.env.HTTPS_CERT_PATH),
+  redirectHttpToHttps: boolFromEnv(process.env.HTTP_REDIRECT_TO_HTTPS, false),
+  httpsPublicHost: process.env.HTTPS_PUBLIC_HOST || '',
   corsOrigin: process.env.CORS_ORIGIN || '*',
+  socketPath: process.env.SOCKET_IO_PATH || '/socket.io',
   turn: {
     enabled: boolFromEnv(process.env.TURN_ENABLED, false),
     host: process.env.TURN_HOST || process.env.MEDIASOUP_ANNOUNCED_IP || '',
@@ -25,7 +40,8 @@ const config = {
     staticAuthSecret: process.env.TURN_STATIC_AUTH_SECRET || '',
     realm: process.env.TURN_REALM || '',
     credentialTtlSec: numberFromEnv(process.env.TURN_CREDENTIAL_TTL_SEC, 3600),
-    forceRelay: boolFromEnv(process.env.WEBRTC_FORCE_RELAY, false)
+    forceRelay: boolFromEnv(process.env.WEBRTC_FORCE_RELAY, false),
+    icePolicy: String(process.env.WEBRTC_ICE_POLICY || '').trim().toLowerCase()
   },
   mediasoup: {
     worker: {

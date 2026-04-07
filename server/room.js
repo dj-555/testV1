@@ -58,6 +58,7 @@ class Room {
     const port = Number(turn.port) || 3478;
     const tlsPort = Number(turn.tlsPort) || 5349;
     const forceRelay = turn.forceRelay === true;
+    const icePolicyOverride = String(turn.icePolicy || '').trim().toLowerCase();
 
     const iceServers = [];
     let hasTurnServer = false;
@@ -86,9 +87,18 @@ class Room {
       }
     }
 
+    let iceTransportPolicy = 'all';
+    if (icePolicyOverride === 'relay') {
+      iceTransportPolicy = hasTurnServer ? 'relay' : 'all';
+    } else if (icePolicyOverride === 'all') {
+      iceTransportPolicy = 'all';
+    } else if (forceRelay && hasTurnServer) {
+      iceTransportPolicy = 'relay';
+    }
+
     return {
       iceServers,
-      iceTransportPolicy: forceRelay && hasTurnServer ? 'relay' : 'all'
+      iceTransportPolicy
     };
   }
 
@@ -123,6 +133,7 @@ class Room {
       id: peer.id,
       role: peer.role,
       name: peer.name,
+      networkType: peer.networkType || 'unknown',
       isActiveSpeaker: peer.id === this.activeStudentId,
       joinedAt: peer.joinedAt
     };
@@ -266,7 +277,7 @@ class Room {
     return Array.from(this.peers.values()).map((peer) => this._peerSummary(peer));
   }
 
-  async joinPeer(socket, { role, name }) {
+  async joinPeer(socket, { role, name, networkType }) {
     const normalizedRole = String(role || '').toLowerCase();
     if (!['teacher', 'student'].includes(normalizedRole)) {
       throw new Error('role must be teacher or student');
@@ -281,6 +292,7 @@ class Room {
       socket,
       role: normalizedRole,
       name: name || (normalizedRole === 'teacher' ? 'Teacher' : 'Student'),
+      networkType: String(networkType || 'unknown'),
       joinedAt: new Date().toISOString(),
       transports: new Map(),
       producers: new Map(),
@@ -297,7 +309,12 @@ class Room {
       this._enqueueStudent(peer.id);
     }
 
-    this.log('joinRoom', { peerId: peer.id, role: peer.role, name: peer.name });
+    this.log('joinRoom', {
+      peerId: peer.id,
+      role: peer.role,
+      name: peer.name,
+      networkType: peer.networkType
+    });
     this._broadcastPeers();
     this._broadcastQueue();
 
