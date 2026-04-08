@@ -3,6 +3,9 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:mediasoup_client_flutter/mediasoup_client_flutter.dart' as ms;
+// ignore: implementation_imports
+import 'package:mediasoup_client_flutter/src/handlers/handler_interface.dart'
+    as mshi;
 import 'package:permission_handler/permission_handler.dart';
 
 import 'signaling.dart';
@@ -81,10 +84,14 @@ class WebRtcClient {
       ValueNotifier<String?>(null);
   final ValueNotifier<List<QueueEntry>> queueNotifier =
       ValueNotifier<List<QueueEntry>>(<QueueEntry>[]);
+  final ValueNotifier<String> iceMethodNotifier =
+      ValueNotifier<String>('not-detected');
 
   String _role = 'student';
   String _displayName = 'Student';
   String _serverUrl = '';
+  String _socketPath = '/socket.io';
+  String _networkTypeHint = 'unknown';
 
   String? _peerId;
 
@@ -123,6 +130,8 @@ class WebRtcClient {
     required String serverUrl,
     required String role,
     required String displayName,
+    String socketPath = '/socket.io',
+    String? networkType,
   }) async {
     if (connectionState.value == 'connecting') {
       return;
@@ -133,13 +142,21 @@ class WebRtcClient {
         ? (_role == 'teacher' ? 'Teacher' : 'Student')
         : displayName.trim();
     _serverUrl = serverUrl.trim();
+    _socketPath = socketPath.trim().isEmpty ? '/socket.io' : socketPath.trim();
+    final normalizedNetworkType = (networkType ?? '').trim();
+    _networkTypeHint =
+        normalizedNetworkType.isEmpty ? 'unknown' : normalizedNetworkType;
+    debugPrint(
+      '[webrtc] connect requested role=$_role '
+      'server=$_serverUrl path=$_socketPath network=$_networkTypeHint',
+    );
 
     _manualDisconnect = false;
     connectionState.value = 'connecting';
 
     await _resetMediaState(notifyServer: false);
 
-    await _signaling.connect(_serverUrl);
+    await _signaling.connect(_serverUrl, socketPath: _socketPath);
     _registerServerEvents();
 
     await _joinAndSetup();
@@ -176,6 +193,7 @@ class WebRtcClient {
     peersNotifier.dispose();
     activeStudentIdNotifier.dispose();
     queueNotifier.dispose();
+    iceMethodNotifier.dispose();
   }
 
   Future<void> approveTurn([String? studentId]) async {
@@ -243,6 +261,7 @@ class WebRtcClient {
     final joinResponse = await _signaling.request('joinRoom', <String, dynamic>{
       'role': _role,
       'name': _displayName,
+      'networkType': _networkTypeHint,
     });
 
     _peerId = joinResponse['peerId']?.toString();
@@ -1247,10 +1266,66 @@ class WebRtcClient {
     peersNotifier.value = <PeerSummary>[];
     activeStudentIdNotifier.value = null;
     queueNotifier.value = <QueueEntry>[];
+    iceMethodNotifier.value = 'not-detected';
 
     localStreamNotifier.value = null;
     teacherRemoteStreamNotifier.value = null;
     activeStudentRemoteStreamNotifier.value = null;
+  }
+
+  void _updateIceDiagnostics(
+    Map<String, dynamic> transportData, {
+    required String direction,
+  }) {
+    final policy = transportData['iceTransportPolicy']?.toString() ?? 'all';
+    final servers = _toMapList(transportData['iceServers']);
+    final urls = <String>[];
+
+    for (final server in servers) {
+      urls.addAll(_toStringList(server['urls'] ?? server['url']));
+    }
+
+    final hasTurn = urls.any((url) {
+      final normalized = url.toLowerCase();
+      return normalized.startsWith('turn:') || normalized.startsWith('turns:');
+    });
+    final hasStun = urls.any((url) => url.toLowerCase().startsWith('stun:'));
+
+    final strategy = _describeIceStrategy(
+      policy: policy,
+      hasTurn: hasTurn,
+      hasStun: hasStun,
+    );
+    iceMethodNotifier.value = strategy;
+
+    debugPrint(
+      '[webrtc] ICE diagnostics direction=$direction '
+      'policy=$policy hasTurn=$hasTurn hasStun=$hasStun urls=$urls strategy=$strategy',
+    );
+  }
+
+  String _describeIceStrategy({
+    required String policy,
+    required bool hasTurn,
+    required bool hasStun,
+  }) {
+    final normalizedPolicy = policy.trim().toLowerCase();
+
+    if (normalizedPolicy == 'relay') {
+      if (hasTurn) return 'TURN relay (strict-firewall mode)';
+      return 'Relay requested but TURN missing';
+    }
+
+    if (hasTurn && hasStun) {
+      return 'Auto ICE (STUN + TURN fallback)';
+    }
+    if (hasTurn) {
+      return 'TURN available';
+    }
+    if (hasStun) {
+      return 'STUN only (NAT direct)';
+    }
+    return 'No ICE servers configured';
   }
 
   String _normalizeKind(dynamic kind) {
@@ -1413,6 +1488,90 @@ class WebRtcClient {
         'source': 'activestudent',
       });
     }
+  }
+
+  List<ms.IceCandidate> _parseIceCandidates(dynamic raw) {
+    if (raw is! List) {
+      return <ms.IceCandidate>[];
+    }
+
+    final candidates = <ms.IceCandidate>[];
+    for (final dynamic item in raw) {
+      final map = _toMap(item);
+      if (map.isEmpty) continue;
+      candidates.add(ms.IceCandidate.fromMap(map));
+    }
+
+    return candidates;
+  }
+
+  List<mshi.RTCIceServer> _parseIceServers(dynamic raw) {
+    if (raw is! List) {
+      return <mshi.RTCIceServer>[];
+    }
+
+    final iceServers = <mshi.RTCIceServer>[];
+    for (final dynamic item in raw) {
+      final map = _toMap(item);
+      if (map.isEmpty) continue;
+
+      final urls = _toStringList(map['urls'] ?? map['url']);
+      if (urls.isEmpty) continue;
+
+      final credential = map['credential']?.toString();
+
+      iceServers.add(
+        mshi.RTCIceServer(
+          credentialType: mshi.RTCIceCredentialType.password,
+          username: map['username']?.toString() ?? '',
+          credential:
+              credential != null && credential.isNotEmpty ? credential : null,
+          urls: urls,
+        ),
+      );
+    }
+
+    return iceServers;
+  }
+
+  mshi.RTCIceTransportPolicy? _parseIceTransportPolicy(dynamic raw) {
+    final policy = raw?.toString().trim().toLowerCase() ?? '';
+    if (policy == 'relay') return mshi.RTCIceTransportPolicy.relay;
+    if (policy == 'all') return mshi.RTCIceTransportPolicy.all;
+    return null;
+  }
+
+  List<String> _toStringList(dynamic raw) {
+    if (raw is String) {
+      final value = raw.trim();
+      return value.isEmpty ? <String>[] : <String>[value];
+    }
+
+    if (raw is List) {
+      final values = <String>[];
+      for (final dynamic item in raw) {
+        final value = item?.toString().trim() ?? '';
+        if (value.isEmpty) continue;
+        values.add(value);
+      }
+      return values;
+    }
+
+    return <String>[];
+  }
+
+  List<Map<String, dynamic>> _toMapList(dynamic raw) {
+    if (raw is! List) {
+      return <Map<String, dynamic>>[];
+    }
+
+    final values = <Map<String, dynamic>>[];
+    for (final dynamic item in raw) {
+      final map = _toMap(item);
+      if (map.isEmpty) continue;
+      values.add(map);
+    }
+    return values;
   }
 
   Map<String, dynamic> _toMap(dynamic raw) {

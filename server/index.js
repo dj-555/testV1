@@ -1,7 +1,9 @@
 require('dotenv').config();
 
 const express = require('express');
+const fs = require('fs');
 const http = require('http');
+const https = require('https');
 const cors = require('cors');
 const { Server } = require('socket.io');
 
@@ -31,19 +33,77 @@ function ackError(ack, error) {
   }
 }
 
+function createPrimaryServer(app) {
+  if (!config.httpsEnabled) {
+    return {
+      server: http.createServer(app),
+      scheme: 'http',
+      port: config.httpPort
+    };
+  }
+
+  if (!config.httpsKeyPath || !config.httpsCertPath) {
+    throw new Error(
+      'HTTPS_ENABLED is true, but HTTPS_KEY_PATH or HTTPS_CERT_PATH is missing in .env'
+    );
+  }
+
+  const tlsOptions = {
+    key: fs.readFileSync(config.httpsKeyPath),
+    cert: fs.readFileSync(config.httpsCertPath)
+  };
+
+  return {
+    server: https.createServer(tlsOptions, app),
+    scheme: 'https',
+    port: config.httpsPort
+  };
+}
+
+function createHttpRedirectServer() {
+  if (!config.httpsEnabled || !config.redirectHttpToHttps) {
+    return null;
+  }
+
+  const redirectApp = express();
+  redirectApp.use((req, res) => {
+    const hostHeader = String(req.headers.host || '').trim();
+    const hostWithoutPort = hostHeader.split(':')[0] || '';
+    const configuredHost = String(config.httpsPublicHost || '').trim();
+    const targetHost = configuredHost || hostWithoutPort;
+    const targetPort = Number(config.httpsPort) || 443;
+    const explicitPort = targetPort === 443 ? '' : `:${targetPort}`;
+    const originalUrl = req.originalUrl || req.url || '/';
+
+    const redirectTo = `https://${targetHost}${explicitPort}${originalUrl}`;
+    res.redirect(308, redirectTo);
+  });
+
+  return http.createServer(redirectApp);
+}
+
 async function bootstrap() {
   const app = express();
   app.use(cors({ origin: config.corsOrigin }));
   app.use(express.json());
 
-  const httpServer = http.createServer(app);
+  const primary = createPrimaryServer(app);
+  const primaryServer = primary.server;
 
-  const io = new Server(httpServer, {
+  const io = new Server(primaryServer, {
     cors: {
       origin: config.corsOrigin,
       methods: ['GET', 'POST']
     },
-    transports: ['websocket', 'polling']
+    transports: ['websocket', 'polling'],
+    path: config.socketPath
+  });
+  io.engine.on('connection_error', (err) => {
+    log('engine connection_error', {
+      code: err.code,
+      message: err.message,
+      context: err.context
+    });
   });
 
   const { worker, router } = await createMediasoupWorkerAndRouter();
@@ -231,16 +291,35 @@ async function bootstrap() {
     });
   });
 
-  httpServer.listen(config.httpPort, () => {
-    log(`HTTP + Socket.IO listening on :${config.httpPort}`);
+  const redirectServer = createHttpRedirectServer();
+
+  primaryServer.listen(primary.port, () => {
+    const label = primary.scheme.toUpperCase();
+    log(`${label} + Socket.IO listening on :${primary.port}`);
+    log(`Socket.IO path: ${config.socketPath}`);
     log('Set MEDIASOUP_ANNOUNCED_IP to your machine LAN/WAN IP for real devices');
   });
+
+  if (redirectServer) {
+    redirectServer.listen(config.httpPort, () => {
+      log(
+        `HTTP redirect server listening on :${config.httpPort} -> https:${config.httpsPort}`
+      );
+    });
+  }
 
   const shutdown = async (signal) => {
     log(`Received ${signal}, shutting down...`);
     io.close();
-    httpServer.close(() => {
-      log('HTTP server closed');
+    primaryServer.close(() => {
+      log('Primary server closed');
+      if (redirectServer) {
+        redirectServer.close(() => {
+          log('HTTP redirect server closed');
+          process.exit(0);
+        });
+        return;
+      }
       process.exit(0);
     });
   };

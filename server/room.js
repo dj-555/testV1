@@ -1,4 +1,6 @@
-﻿const { createWebRtcTransport } = require('./mediasoup');
+const crypto = require('crypto');
+const { createWebRtcTransport } = require('./mediasoup');
+const config = require('./config');
 
 class Room {
   constructor({ router, io }) {
@@ -23,6 +25,81 @@ class Room {
       return;
     }
     console.log(`[${timestamp}] [room] ${event}`);
+  }
+
+  _buildTurnCredentials(peerId) {
+    const turn = config.turn || {};
+
+    if (turn.staticAuthSecret && turn.realm) {
+      const nowSec = Math.floor(Date.now() / 1000);
+      const ttlSec = Math.max(Number(turn.credentialTtlSec) || 3600, 60);
+      const username = `${nowSec + ttlSec}:${peerId}`;
+      const credential = crypto
+        .createHmac('sha1', turn.staticAuthSecret)
+        .update(username)
+        .digest('base64');
+
+      return { username, credential };
+    }
+
+    if (turn.username && turn.password) {
+      return {
+        username: String(turn.username),
+        credential: String(turn.password)
+      };
+    }
+
+    return null;
+  }
+
+  _buildIceSettingsForPeer(peerId) {
+    const turn = config.turn || {};
+    const host = String(turn.host || '').trim();
+    const port = Number(turn.port) || 3478;
+    const tlsPort = Number(turn.tlsPort) || 5349;
+    const forceRelay = turn.forceRelay === true;
+    const icePolicyOverride = String(turn.icePolicy || '').trim().toLowerCase();
+
+    const iceServers = [];
+    let hasTurnServer = false;
+
+    if (host) {
+      iceServers.push({
+        urls: [`stun:${host}:${port}`]
+      });
+    }
+
+    if (turn.enabled && host) {
+      const credentials = this._buildTurnCredentials(peerId);
+      if (credentials) {
+        iceServers.push({
+          urls: [
+            `turn:${host}:${port}?transport=udp`,
+            `turn:${host}:${port}?transport=tcp`,
+            `turns:${host}:${tlsPort}?transport=tcp`
+          ],
+          username: credentials.username,
+          credential: credentials.credential
+        });
+        hasTurnServer = true;
+      } else {
+        this.log('TURN is enabled but credentials are missing. Using STUN only.');
+      }
+    }
+
+    let iceTransportPolicy = 'all';
+    if (icePolicyOverride === 'relay') {
+      iceTransportPolicy = hasTurnServer ? 'relay' : 'all';
+    } else if (icePolicyOverride === 'all') {
+      iceTransportPolicy = 'all';
+    } else if (forceRelay && hasTurnServer) {
+      iceTransportPolicy = 'relay';
+    }
+
+    return {
+      iceServers,
+      iceTransportPolicy
+    };
   }
 
   _normalizeKind(kind) {
@@ -56,6 +133,7 @@ class Room {
       id: peer.id,
       role: peer.role,
       name: peer.name,
+      networkType: peer.networkType || 'unknown',
       isActiveSpeaker: peer.id === this.activeStudentId,
       joinedAt: peer.joinedAt
     };
@@ -226,6 +304,7 @@ class Room {
       socket,
       role: normalizedRole,
       name: name || (normalizedRole === 'teacher' ? 'Teacher' : 'Student'),
+      networkType: String(networkType || 'unknown'),
       joinedAt: new Date().toISOString(),
       transports: new Map(),
       producers: new Map(),
@@ -246,123 +325,7 @@ class Room {
       peerId: peer.id,
       role: peer.role,
       name: peer.name,
-      rtpCapabilities: this.router.rtpCapabilities,
-      peers: this.getPeersForClient(),
-      producers: this._getJoinProducers(peer.id),
-      teacherId: this.teacherId,
-      activeStudentId: this.activeStudentId,
-      queue: this.getQueueForClient(),
-      teacherProducers: { ...this.teacherProducers },
-      activeStudentProducers: { ...this.activeStudentProducers }
-    };
-  }
-
-  async createTransport(peerId, direction) {
-    const peer = this._getPeerOrThrow(peerId);
-
-    if (!['send', 'recv'].includes(direction)) {
-      throw new Error('direction must be send or recv');
-    }
-
-    const transport = await createWebRtcTransport(this.router);
-    transport.appData = {
-      peerId: peer.id,
-      direction
-    };
-
-    peer.transports.set(transport.id, transport);
-
-    this.log('createTransport', {
-      peerId,
-      direction,
-      transportId: transport.id
-    });
-
-    return {
-      id: transport.id,
-      iceParameters: transport.iceParameters,
-      iceCandidates: transport.iceCandidates,
-      dtlsParameters: transport.dtlsParameters,
-      sctpParameters: transport.sctpParameters
-    };
-  }
-
-  async connectTransport(peerId, transportId, dtlsParameters) {
-    const peer = this._getPeerOrThrow(peerId);
-    const transport = peer.transports.get(transportId);
-
-    if (!transport) {
-      throw new Error(`Transport not found: ${transportId}`);
-    }
-
-    await transport.connect({ dtlsParameters });
-
-    this.log('connectTransport', {
-      peerId,
-      transportId,
-      direction: transport.appData?.direction
-    });
-  }
-
-  async produce(peerId, transportId, kind, rtpParameters, appData = {}) {
-    const peer = this._getPeerOrThrow(peerId);
-    const transport = peer.transports.get(transportId);
-
-    if (!transport) {
-      throw new Error(`Transport not found: ${transportId}`);
-    }
-
-    if (transport.appData?.direction !== 'send') {
-      throw new Error('Transport is not a send transport');
-    }
-
-    if (peer.role === 'student' && this.activeStudentId !== peer.id) {
-      throw new Error('Student is not approved to speak right now');
-    }
-
-    const normalizedKind = this._normalizeKind(kind);
-
-    for (const existingProducer of peer.producers.values()) {
-      if (this._normalizeKind(existingProducer.kind) === normalizedKind) {
-        await this.closeProducer(peer.id, existingProducer.id, { emit: true, shouldClose: true });
-      }
-    }
-
-    const producer = await transport.produce({
-      kind: normalizedKind,
-      rtpParameters,
-      appData: {
-        ...appData,
-        peerId: peer.id,
-        role: peer.role,
-        name: peer.name,
-        kind: normalizedKind,
-        source: peer.role === 'teacher' ? 'teacher' : 'activeStudent'
-      }
-    });
-
-    peer.producers.set(producer.id, producer);
-    this.producerToPeer.set(producer.id, peer.id);
-
-    if (peer.role === 'teacher') {
-      this.teacherProducers[normalizedKind] = producer.id;
-    }
-
-    if (peer.role === 'student' && this.activeStudentId === peer.id) {
-      this.activeStudentProducers[normalizedKind] = producer.id;
-    }
-
-    producer.on('transportclose', () => {
-      this.closeProducer(peer.id, producer.id, { emit: true, shouldClose: false }).catch((error) => {
-        this.log('producer transportclose cleanup failed', { producerId: producer.id, error: error.message });
-      });
-    });
-
-    this.log('produce', {
-      peerId: peer.id,
-      role: peer.role,
-      kind: normalizedKind,
-      producerId: producer.id
+      networkType: peer.networkType
     });
 
     peer.socket.broadcast.emit('newProducer', this._producerPayload(peer, producer));
