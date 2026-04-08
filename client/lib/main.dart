@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
@@ -58,9 +59,15 @@ class QuranLiveClassPage extends StatefulWidget {
 
 class _QuranLiveClassPageState extends State<QuranLiveClassPage> {
   static const int _globalQuarterTurnOffset = 2;
+  static const String _serverUrl = String.fromEnvironment(
+    'APP_SERVER_URL',
+    defaultValue: 'https://sbc.itcallinfo.info',
+  );
+  static const String _socketPath = String.fromEnvironment(
+    'APP_SOCKET_PATH',
+    defaultValue: '/quran-socket.io',
+  );
 
-  final TextEditingController _serverController =
-      TextEditingController(text: 'http://62.171.178.72:3000');
   final TextEditingController _nameController =
       TextEditingController(text: 'Teacher');
 
@@ -69,17 +76,22 @@ class _QuranLiveClassPageState extends State<QuranLiveClassPage> {
   final RTCVideoRenderer _activeStudentRenderer = RTCVideoRenderer();
 
   late final WebRtcClient _client;
+  final Connectivity _connectivity = Connectivity();
 
   String _selectedRole = 'teacher';
   String _status = 'disconnected';
+  String _networkType = 'detecting...';
+  String _iceMethod = 'not-detected';
   bool _isBusy = false;
   bool _renderersReady = false;
+  String? _startupError;
   bool _studentPipSwapped = false;
   bool _teacherPipSwapped = false;
 
   List<PeerSummary> _peers = <PeerSummary>[];
   List<QueueEntry> _queue = <QueueEntry>[];
   String? _activeStudentId;
+  StreamSubscription<dynamic>? _networkSubscription;
 
   @override
   void initState() {
@@ -94,25 +106,38 @@ class _QuranLiveClassPageState extends State<QuranLiveClassPage> {
     _client.peersNotifier.addListener(_onPeersChanged);
     _client.activeStudentIdNotifier.addListener(_onActiveStudentChanged);
     _client.queueNotifier.addListener(_onQueueChanged);
+    _client.iceMethodNotifier.addListener(_onIceMethodChanged);
 
     _initRenderers();
+    unawaited(_initNetworkInfo());
   }
 
   Future<void> _initRenderers() async {
-    await Future.wait(<Future<void>>[
-      _localRenderer.initialize(),
-      _teacherRenderer.initialize(),
-      _activeStudentRenderer.initialize(),
-    ]);
+    try {
+      await Future.wait(<Future<void>>[
+        _localRenderer.initialize(),
+        _teacherRenderer.initialize(),
+        _activeStudentRenderer.initialize(),
+      ]);
 
-    _localRenderer.onResize = _onRendererResize;
-    _teacherRenderer.onResize = _onRendererResize;
-    _activeStudentRenderer.onResize = _onRendererResize;
+      _localRenderer.onResize = _onRendererResize;
+      _teacherRenderer.onResize = _onRendererResize;
+      _activeStudentRenderer.onResize = _onRendererResize;
 
-    if (!mounted) return;
-    setState(() {
-      _renderersReady = true;
-    });
+      if (!mounted) return;
+      setState(() {
+        _renderersReady = true;
+        _startupError = null;
+      });
+    } catch (error, stackTrace) {
+      debugPrint('[ui] renderer init failed: $error');
+      debugPrintStack(stackTrace: stackTrace);
+      if (!mounted) return;
+      setState(() {
+        _renderersReady = false;
+        _startupError = error.toString();
+      });
+    }
   }
 
   void _onRendererResize() {
@@ -167,6 +192,65 @@ class _QuranLiveClassPageState extends State<QuranLiveClassPage> {
     });
   }
 
+  void _onIceMethodChanged() {
+    if (!mounted) return;
+    setState(() {
+      _iceMethod = _client.iceMethodNotifier.value;
+    });
+  }
+
+  Future<void> _initNetworkInfo() async {
+    try {
+      final current = await _connectivity.checkConnectivity();
+      _setNetworkTypeFromRaw(current);
+
+      _networkSubscription = _connectivity.onConnectivityChanged.listen(
+        _setNetworkTypeFromRaw,
+        onError: (Object error, StackTrace stackTrace) {
+          debugPrint('[ui] connectivity stream error: $error');
+          debugPrintStack(stackTrace: stackTrace);
+        },
+      );
+    } catch (error, stackTrace) {
+      debugPrint('[ui] connectivity detection failed: $error');
+      debugPrintStack(stackTrace: stackTrace);
+      if (!mounted) return;
+      setState(() {
+        _networkType = 'unavailable';
+      });
+    }
+  }
+
+  void _setNetworkTypeFromRaw(dynamic raw) {
+    final values = raw is List ? raw : <dynamic>[raw];
+    final labels = <String>[];
+    for (final value in values) {
+      final label = _networkLabel(value);
+      if (label.isEmpty || label == 'Offline') continue;
+      if (!labels.contains(label)) {
+        labels.add(label);
+      }
+    }
+
+    final result = labels.isEmpty ? 'Offline' : labels.join(' + ');
+    if (!mounted) return;
+    setState(() {
+      _networkType = result;
+    });
+  }
+
+  String _networkLabel(dynamic value) {
+    final text = value?.toString().toLowerCase() ?? '';
+    if (text.contains('wifi')) return 'Wi-Fi';
+    if (text.contains('mobile')) return 'Mobile';
+    if (text.contains('ethernet')) return 'Ethernet';
+    if (text.contains('vpn')) return 'VPN';
+    if (text.contains('bluetooth')) return 'Bluetooth';
+    if (text.contains('none')) return 'Offline';
+    if (text.contains('other')) return 'Other';
+    return text.trim().isEmpty ? '' : value.toString();
+  }
+
   void _toggleStudentPipSwap() {
     if (!mounted) return;
     setState(() {
@@ -198,12 +282,16 @@ class _QuranLiveClassPageState extends State<QuranLiveClassPage> {
         await _client.disconnect();
       } else {
         await _client.connect(
-          serverUrl: _serverController.text.trim(),
+          serverUrl: _serverUrl,
           role: _selectedRole,
           displayName: _nameController.text.trim(),
+          socketPath: _socketPath,
+          networkType: _networkType,
         );
       }
-    } catch (error) {
+    } catch (error, stackTrace) {
+      debugPrint('[ui] connect/disconnect failed: $error');
+      debugPrintStack(stackTrace: stackTrace);
       _showSnack(error.toString());
     } finally {
       if (mounted) {
@@ -263,6 +351,8 @@ class _QuranLiveClassPageState extends State<QuranLiveClassPage> {
     _client.peersNotifier.removeListener(_onPeersChanged);
     _client.activeStudentIdNotifier.removeListener(_onActiveStudentChanged);
     _client.queueNotifier.removeListener(_onQueueChanged);
+    _client.iceMethodNotifier.removeListener(_onIceMethodChanged);
+    unawaited(_networkSubscription?.cancel());
     if (_renderersReady) {
       _localRenderer.srcObject = null;
       _teacherRenderer.srcObject = null;
@@ -273,7 +363,6 @@ class _QuranLiveClassPageState extends State<QuranLiveClassPage> {
     unawaited(_teacherRenderer.dispose());
     unawaited(_activeStudentRenderer.dispose());
 
-    _serverController.dispose();
     _nameController.dispose();
 
     super.dispose();
@@ -319,7 +408,42 @@ class _QuranLiveClassPageState extends State<QuranLiveClassPage> {
                 ),
               ),
             )
-          : const Center(child: CircularProgressIndicator()),
+          : _buildStartupState(),
+    );
+  }
+
+  Widget _buildStartupState() {
+    if (_startupError == null) {
+      return const Center(child: CircularProgressIndicator());
+    }
+
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            const Icon(Icons.error_outline, size: 42, color: Colors.redAccent),
+            const SizedBox(height: 12),
+            const Text(
+              'App startup failed',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              _startupError!,
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: Colors.black54),
+            ),
+            const SizedBox(height: 12),
+            FilledButton.icon(
+              onPressed: _initRenderers,
+              icon: const Icon(Icons.refresh),
+              label: const Text('Retry'),
+            ),
+          ],
+        ),
+      ),
     );
   }
 
@@ -522,10 +646,40 @@ class _QuranLiveClassPageState extends State<QuranLiveClassPage> {
               decoration: const InputDecoration(labelText: 'Display Name'),
             ),
             const SizedBox(height: 12),
-            TextField(
-              controller: _serverController,
-              enabled: !_isConnected,
-              decoration: const InputDecoration(labelText: 'Server URL'),
+            Text(
+              'Server: $_serverUrl',
+              style: const TextStyle(
+                fontSize: 12,
+                color: Colors.black54,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              'Socket path: $_socketPath',
+              style: const TextStyle(
+                fontSize: 12,
+                color: Colors.black54,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              'Network: $_networkType',
+              style: const TextStyle(
+                fontSize: 12,
+                color: Colors.black54,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              'ICE/NAT: $_iceMethod',
+              style: const TextStyle(
+                fontSize: 12,
+                color: Colors.black54,
+                fontWeight: FontWeight.w600,
+              ),
             ),
             const SizedBox(height: 12),
             Row(

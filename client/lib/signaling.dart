@@ -5,6 +5,7 @@ import 'package:socket_io_client/socket_io_client.dart' as io;
 
 class SignalingClient {
   io.Socket? _socket;
+  static const Duration _singleConnectTimeout = Duration(seconds: 8);
 
   final StreamController<void> _connectController =
       StreamController<void>.broadcast();
@@ -23,17 +24,55 @@ class SignalingClient {
 
   String? get socketId => _socket?.id;
 
-  Future<void> connect(String serverUrl) async {
+  Future<void> connect(
+    String serverUrl, {
+    String socketPath = '/socket.io',
+  }) async {
     await disconnect();
 
-    final completer = Completer<void>();
+    final normalizedSocketPath = _normalizeSocketPath(socketPath);
+    final connectionCandidates = _buildConnectionCandidates(serverUrl);
+    final attemptErrors = <String>[];
 
-    debugPrint('[signal] connect -> $serverUrl');
+    for (int i = 0; i < connectionCandidates.length; i++) {
+      final candidateUrl = connectionCandidates[i];
+      final attempt = i + 1;
+      try {
+        debugPrint(
+            '[signal] connect attempt $attempt/${connectionCandidates.length} -> $candidateUrl path=$normalizedSocketPath');
+        await _connectToSingleServer(
+          candidateUrl,
+          socketPath: normalizedSocketPath,
+        );
+        return;
+      } catch (error, stackTrace) {
+        final errorText = error.toString();
+        attemptErrors.add('$candidateUrl => $errorText');
+        debugPrint('[signal] connect attempt failed: $errorText');
+        debugPrintStack(stackTrace: stackTrace);
+        await disconnect();
+      }
+    }
+
+    final attempted = connectionCandidates.join(', ');
+    throw Exception(
+      'Socket connect failed on all endpoints. '
+      'Tried: $attempted. '
+      'Details: ${attemptErrors.join(' | ')}',
+    );
+  }
+
+  Future<void> _connectToSingleServer(
+    String serverUrl, {
+    required String socketPath,
+  }) async {
+    final completer = Completer<void>();
 
     _socket = io.io(
       serverUrl,
       io.OptionBuilder()
-          .setTransports(['websocket'])
+          .setPath(socketPath)
+          .setTransports(<String>['websocket', 'polling'])
           .enableForceNew()
           .disableAutoConnect()
           .enableReconnection()
@@ -44,7 +83,8 @@ class SignalingClient {
     );
 
     _socket!.onConnect((_) {
-      debugPrint('[signal] connected socketId=${_socket?.id}');
+      debugPrint(
+          '[signal] connected socketId=${_socket?.id} via $serverUrl path=$socketPath');
       _connectController.add(null);
       if (!completer.isCompleted) {
         completer.complete();
@@ -58,14 +98,14 @@ class SignalingClient {
     });
 
     _socket!.onConnectError((error) {
-      debugPrint('[signal] connect_error $error');
+      debugPrint('[signal] connect_error=$error server=$serverUrl');
       if (!completer.isCompleted) {
-        completer.completeError(Exception('Socket connect error: $error'));
+        completer.completeError(Exception(error.toString()));
       }
     });
 
     _socket!.onError((error) {
-      debugPrint('[signal] error $error');
+      debugPrint('[signal] error=$error server=$serverUrl');
     });
 
     _socket!.onReconnect((attempt) {
@@ -89,9 +129,82 @@ class SignalingClient {
     _socket!.connect();
 
     await completer.future.timeout(
-      const Duration(seconds: 12),
-      onTimeout: () => throw Exception('Socket connect timeout'),
+      _singleConnectTimeout,
+      onTimeout: () => throw Exception('Socket connect timeout for $serverUrl'),
     );
+  }
+
+  String _normalizeSocketPath(String rawPath) {
+    final trimmed = rawPath.trim();
+    if (trimmed.isEmpty) return '/socket.io';
+    if (trimmed.startsWith('/')) return trimmed;
+    return '/$trimmed';
+  }
+
+  List<String> _buildConnectionCandidates(String rawUrl) {
+    final normalized = _normalizeSocketServerUrl(rawUrl);
+    final base = Uri.parse(normalized);
+    final candidates = <String>[];
+
+    void addCandidate(Uri uri) {
+      final value = uri.toString().split('#').first;
+      if (!candidates.contains(value)) {
+        candidates.add(value);
+      }
+    }
+
+    addCandidate(base);
+
+    if (base.scheme == 'https') {
+      addCandidate(base.replace(scheme: 'http', port: 3000));
+      if (base.port != 443) {
+        addCandidate(base.replace(scheme: 'https', port: 443));
+      }
+    } else {
+      addCandidate(base.replace(scheme: 'https', port: null));
+      addCandidate(base.replace(scheme: 'https', port: 443));
+      if (base.port != 3000) {
+        addCandidate(base.replace(scheme: 'http', port: 3000));
+      }
+    }
+
+    return candidates;
+  }
+
+  String _normalizeSocketServerUrl(String rawUrl) {
+    final trimmed = rawUrl.trim();
+    if (trimmed.isEmpty) {
+      throw Exception('Server URL is required');
+    }
+
+    final hasScheme = RegExp(r'^[a-zA-Z][a-zA-Z0-9+\-.]*://').hasMatch(trimmed);
+    final candidate = hasScheme ? trimmed : 'https://$trimmed';
+
+    Uri uri;
+    try {
+      uri = Uri.parse(candidate);
+    } catch (_) {
+      throw Exception('Invalid server URL: "$rawUrl"');
+    }
+
+    var scheme = uri.scheme.toLowerCase();
+    if (scheme == 'ws') {
+      scheme = 'http';
+    } else if (scheme == 'wss') {
+      scheme = 'https';
+    }
+
+    if (scheme != 'http' && scheme != 'https') {
+      throw Exception(
+        'Invalid URL scheme "$scheme". Use http://, https://, ws://, or wss://.',
+      );
+    }
+
+    if (uri.host.isEmpty) {
+      throw Exception('Invalid server URL: missing host');
+    }
+
+    return uri.replace(scheme: scheme).toString().split('#').first;
   }
 
   void on(String event, void Function(dynamic data) handler) {
