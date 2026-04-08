@@ -47,6 +47,14 @@ async function createWebRtcTransport(routerInstance) {
     }
   });
 
+  transport.on('icestatechange', (iceState) => {
+    log(`Transport ${transport.id} icestatechange=${iceState}`);
+  });
+
+  transport.on('iceselectedtuplechange', (tuple) => {
+    log(`Transport ${transport.id} iceselectedtuplechange`, tuple);
+  });
+
   transport.on('close', () => {
     log(`Transport ${transport.id} closed`);
   });

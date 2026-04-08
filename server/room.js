@@ -115,9 +115,11 @@ class Room {
   }
 
   _enqueueStudent(peerId) {
-    if (!peerId || this.studentQueue.includes(peerId)) {
+    if (!peerId) {
       return;
     }
+
+    this._removeFromQueue(peerId);
     this.studentQueue.push(peerId);
   }
 
@@ -150,11 +152,21 @@ class Room {
     if (peer.role !== 'student') {
       throw new Error('Only students can join queue');
     }
+    if (this.activeStudentId === peer.id) {
+      return {
+        queue: this.getQueueForClient(),
+        activeStudentId: this.activeStudentId
+      };
+    }
+    if (peer.wantsQueue && this.studentQueue.includes(peer.id)) {
+      return {
+        queue: this.getQueueForClient(),
+        activeStudentId: this.activeStudentId
+      };
+    }
 
     peer.wantsQueue = true;
-    if (this.activeStudentId !== peer.id) {
-      this._enqueueStudent(peer.id);
-    }
+    this._enqueueStudent(peer.id);
 
     this._broadcastPeers();
     this._broadcastQueue();
@@ -218,7 +230,7 @@ class Room {
       transports: new Map(),
       producers: new Map(),
       consumers: new Map(),
-      wantsQueue: normalizedRole === 'student'
+      wantsQueue: false
     };
 
     this.peers.set(peer.id, peer);
@@ -226,10 +238,6 @@ class Room {
     if (peer.role === 'teacher') {
       this.teacherId = peer.id;
     }
-    if (peer.role === 'student') {
-      this._enqueueStudent(peer.id);
-    }
-
     this.log('joinRoom', { peerId: peer.id, role: peer.role, name: peer.name });
     this._broadcastPeers();
     this._broadcastQueue();
@@ -516,6 +524,7 @@ class Room {
     this.activeStudentId = requestedStudentId;
     this._syncActiveStudentProducerSlots(studentPeer);
     this._removeFromQueue(requestedStudentId);
+    studentPeer.wantsQueue = false;
 
     studentPeer.socket.emit('turnApproved', {
       studentId: requestedStudentId,
@@ -547,6 +556,25 @@ class Room {
     return { activeStudentId: this.activeStudentId };
   }
 
+  async restartIce(peerId, transportId) {
+    const peer = this._getPeerOrThrow(peerId);
+    const transport = peer.transports.get(transportId);
+
+    if (!transport) {
+      throw new Error(`Transport not found: ${transportId}`);
+    }
+
+    const iceParameters = await transport.restartIce();
+
+    this.log('restartIce', {
+      peerId,
+      transportId,
+      direction: transport.appData?.direction
+    });
+
+    return { iceParameters };
+  }
+
   async _endActiveTurnInternal(reason) {
     if (!this.activeStudentId) {
       return;
@@ -559,6 +587,7 @@ class Room {
     this.activeStudentProducers = { audio: null, video: null };
 
     if (studentPeer) {
+      studentPeer.wantsQueue = false;
       const producerIds = Array.from(studentPeer.producers.keys());
       for (const producerId of producerIds) {
         await this.closeProducer(studentPeer.id, producerId, { emit: true, shouldClose: true });
@@ -568,13 +597,6 @@ class Room {
         studentId,
         reason
       });
-
-      const shouldRequeue =
-        (reason === 'ended_by_teacher' || reason === 'replaced_by_teacher') &&
-        studentPeer.wantsQueue;
-      if (shouldRequeue) {
-        this._enqueueStudent(studentPeer.id);
-      }
     }
 
     this.io.emit('activeStudentChanged', {

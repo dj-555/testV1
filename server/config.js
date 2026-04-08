@@ -1,4 +1,13 @@
-﻿const config = {
+function boolFromEnv(name, fallback) {
+  const value = process.env[name];
+  if (value == null) {
+    return fallback;
+  }
+
+  return ['1', 'true', 'yes', 'on'].includes(String(value).toLowerCase());
+}
+
+const config = {
   httpPort: Number(process.env.PORT || 3000),
   corsOrigin: process.env.CORS_ORIGIN || '*',
   mediasoup: {
@@ -44,9 +53,11 @@
           announcedIp: process.env.MEDIASOUP_ANNOUNCED_IP || undefined
         }
       ],
-      enableUdp: true,
-      enableTcp: true,
-      preferUdp: true,
+      enableUdp: boolFromEnv('MEDIASOUP_ENABLE_UDP', true),
+      enableTcp: boolFromEnv('MEDIASOUP_ENABLE_TCP', true),
+      preferUdp: boolFromEnv('MEDIASOUP_PREFER_UDP', true),
+      preferTcp: boolFromEnv('MEDIASOUP_PREFER_TCP', false),
+      iceConsentTimeout: Number(process.env.MEDIASOUP_ICE_CONSENT_TIMEOUT || 30),
       initialAvailableOutgoingBitrate: 1_000_000,
       maxIncomingBitrate: 1_500_000
     }

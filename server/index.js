@@ -111,6 +111,17 @@ async function bootstrap() {
       }
     });
 
+    socket.on('restartIce', async (payload = {}, ack) => {
+      log('restartIce', { socketId: socket.id, payload });
+      try {
+        const data = await room.restartIce(socket.id, payload.transportId);
+        ackOk(ack, data);
+      } catch (error) {
+        log('restartIce error', { socketId: socket.id, error: error.message });
+        ackError(ack, error);
+      }
+    });
+
     socket.on('produce', async (payload = {}, ack) => {
       log('produce', { socketId: socket.id, payloadSummary: { transportId: payload.transportId, kind: payload.kind } });
       try {

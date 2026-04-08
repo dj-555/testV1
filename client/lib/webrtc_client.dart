@@ -112,6 +112,9 @@ class WebRtcClient {
   StreamSubscription<int>? _reconnectSub;
   StreamSubscription<String>? _disconnectSub;
   Future<void> _rebuildRemoteStreamsQueue = Future<void>.value();
+  final Set<String> _iceRestartingTransportIds = <String>{};
+  String _teacherRemoteStreamSignature = '';
+  String _activeStudentRemoteStreamSignature = '';
 
   bool get isTeacher => _role == 'teacher';
   String? get peerId => _peerId;
@@ -293,20 +296,27 @@ class WebRtcClient {
       'direction': 'recv',
     });
 
-    _recvTransport = _device!.createRecvTransportFromMap(
+    final transport = _device!.createRecvTransportFromMap(
       response,
       consumerCallback: _onConsumerCreated,
     );
+    _recvTransport = transport;
 
-    _recvTransport!.on('connect', (dynamic data) async {
-      await _onTransportConnect(_recvTransport!, _toMap(data));
+    transport.on('connect', (dynamic data) async {
+      await _onTransportConnect(transport, _toMap(data));
     });
 
-    _recvTransport!.on('connectionstatechange', (dynamic state) {
-      debugPrint('[webrtc] recvTransport state=$state');
+    transport.on('connectionstatechange', (dynamic state) {
+      unawaited(
+        _handleTransportStateChange(
+          transport,
+          state,
+          label: 'recv',
+        ),
+      );
     });
 
-    debugPrint('[webrtc] recv transport created id=${_recvTransport!.id}');
+    debugPrint('[webrtc] recv transport created id=${transport.id}');
   }
 
   Future<void> _createSendTransportIfNeeded() async {
@@ -317,24 +327,92 @@ class WebRtcClient {
       'direction': 'send',
     });
 
-    _sendTransport = _device!.createSendTransportFromMap(
+    final transport = _device!.createSendTransportFromMap(
       response,
       producerCallback: _onProducerCreated,
     );
+    _sendTransport = transport;
 
-    _sendTransport!.on('connect', (dynamic data) async {
-      await _onTransportConnect(_sendTransport!, _toMap(data));
+    transport.on('connect', (dynamic data) async {
+      await _onTransportConnect(transport, _toMap(data));
     });
 
-    _sendTransport!.on('produce', (dynamic data) async {
+    transport.on('produce', (dynamic data) async {
       await _onTransportProduce(_toMap(data));
     });
 
-    _sendTransport!.on('connectionstatechange', (dynamic state) {
-      debugPrint('[webrtc] sendTransport state=$state');
+    transport.on('connectionstatechange', (dynamic state) {
+      unawaited(
+        _handleTransportStateChange(
+          transport,
+          state,
+          label: 'send',
+        ),
+      );
     });
 
-    debugPrint('[webrtc] send transport created id=${_sendTransport!.id}');
+    debugPrint('[webrtc] send transport created id=${transport.id}');
+  }
+
+  Future<void> _handleTransportStateChange(
+    ms.Transport transport,
+    dynamic rawState, {
+    required String label,
+  }) async {
+    final state = rawState?.toString().toLowerCase() ?? 'unknown';
+    debugPrint('[webrtc] ${label}Transport state=$state');
+
+    if (transport.closed || !_signaling.isConnected) {
+      return;
+    }
+
+    if (state == 'disconnected') {
+      await Future<void>.delayed(const Duration(milliseconds: 1200));
+      if (transport.closed ||
+          !_signaling.isConnected ||
+          transport.connectionState.toLowerCase() != 'disconnected') {
+        return;
+      }
+      await _restartIceForTransport(transport, reason: '$label-disconnected');
+      return;
+    }
+
+    if (state == 'failed') {
+      await _restartIceForTransport(transport, reason: '$label-failed');
+    }
+  }
+
+  Future<void> _restartIceForTransport(
+    ms.Transport transport, {
+    required String reason,
+  }) async {
+    final transportId = transport.id;
+    if (transport.closed || !_signaling.isConnected) {
+      return;
+    }
+    if (!_iceRestartingTransportIds.add(transportId)) {
+      return;
+    }
+
+    try {
+      final response = await _signaling.request('restartIce', <String, dynamic>{
+        'transportId': transportId,
+      });
+      final iceParameters = _toMap(response['iceParameters']);
+      if (iceParameters.isEmpty || transport.closed) {
+        return;
+      }
+
+      transport.restartIce(ms.IceParameters.fromMap(iceParameters));
+      debugPrint(
+        '[webrtc] restartIce queued transportId=$transportId reason=$reason',
+      );
+    } catch (error) {
+      debugPrint(
+          '[webrtc] restartIce failed transportId=$transportId error=$error');
+    } finally {
+      _iceRestartingTransportIds.remove(transportId);
+    }
   }
 
   Future<void> _onTransportConnect(
@@ -635,15 +713,23 @@ class WebRtcClient {
       }
     }
 
+    final teacherSignature = _consumerSignature(teacherConsumers);
+    final activeStudentSignature = _consumerSignature(activeStudentConsumers);
     final nextTeacherRemoteStream = await _buildRemoteStream(
       streamId: 'teacher-remote',
       label: 'teacher',
       consumers: teacherConsumers,
+      currentStream: _teacherRemoteStream,
+      previousSignature: _teacherRemoteStreamSignature,
+      nextSignature: teacherSignature,
     );
     final nextActiveStudentRemoteStream = await _buildRemoteStream(
       streamId: 'active-student-remote',
       label: 'activeStudent',
       consumers: activeStudentConsumers,
+      currentStream: _activeStudentRemoteStream,
+      previousSignature: _activeStudentRemoteStreamSignature,
+      nextSignature: activeStudentSignature,
     );
 
     final previousTeacherRemoteStream = _teacherRemoteStream;
@@ -651,6 +737,10 @@ class WebRtcClient {
 
     _teacherRemoteStream = nextTeacherRemoteStream;
     _activeStudentRemoteStream = nextActiveStudentRemoteStream;
+    _teacherRemoteStreamSignature =
+        teacherConsumers.isEmpty ? '' : teacherSignature;
+    _activeStudentRemoteStreamSignature =
+        activeStudentConsumers.isEmpty ? '' : activeStudentSignature;
 
     teacherRemoteStreamNotifier.value = _teacherRemoteStream;
     activeStudentRemoteStreamNotifier.value = _activeStudentRemoteStream;
@@ -674,9 +764,17 @@ class WebRtcClient {
     required String streamId,
     required String label,
     required List<ms.Consumer> consumers,
+    required MediaStream? currentStream,
+    required String previousSignature,
+    required String nextSignature,
   }) async {
     if (consumers.isEmpty) {
       return null;
+    }
+    if (currentStream != null &&
+        previousSignature.isNotEmpty &&
+        previousSignature == nextSignature) {
+      return currentStream;
     }
 
     final stream = await createLocalMediaStream(streamId);
@@ -698,6 +796,16 @@ class WebRtcClient {
     }
 
     return stream;
+  }
+
+  String _consumerSignature(List<ms.Consumer> consumers) {
+    final signatureParts = consumers.map((consumer) {
+      final kind = _normalizeKind(consumer.kind ?? consumer.track.kind);
+      return '${consumer.id}:${consumer.producerId}:$kind:${consumer.track.id}';
+    }).toList()
+      ..sort();
+
+    return signatureParts.join('|');
   }
 
   Future<void> _disposeIfDifferent({
@@ -921,13 +1029,6 @@ class WebRtcClient {
       rebuilt.add(QueueEntry(id: peer.id, name: peer.name));
     }
 
-    for (final peer in peersNotifier.value) {
-      if (peer.role != 'student') continue;
-      if (peer.id == activeStudentId) continue;
-      if (!seen.add(peer.id)) continue;
-      rebuilt.add(QueueEntry(id: peer.id, name: peer.name));
-    }
-
     queueNotifier.value = rebuilt;
   }
 
@@ -1030,6 +1131,8 @@ class WebRtcClient {
     _consumersByProducerId.clear();
     _consumerMetaById.clear();
     _producerMetaById.clear();
+    _teacherRemoteStreamSignature = '';
+    _activeStudentRemoteStreamSignature = '';
 
     teacherRemoteStreamNotifier.value = null;
     activeStudentRemoteStreamNotifier.value = null;
@@ -1046,6 +1149,7 @@ class WebRtcClient {
 
     _sendTransport = null;
     _recvTransport = null;
+    _iceRestartingTransportIds.clear();
   }
 
   Future<void> _closeSendTransportOnly() async {
@@ -1125,6 +1229,9 @@ class WebRtcClient {
       }
       _activeStudentRemoteStream = null;
     }
+
+    _teacherRemoteStreamSignature = '';
+    _activeStudentRemoteStreamSignature = '';
   }
 
   Future<void> _resetMediaState({required bool notifyServer}) async {
