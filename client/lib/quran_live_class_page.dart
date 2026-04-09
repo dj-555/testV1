@@ -300,6 +300,14 @@ class _QuranLiveClassPageState extends State<QuranLiveClassPage> {
     }
   }
 
+  Future<void> _endLastStudentTurn() async {
+    try {
+      await _client.endTurn();
+    } catch (error) {
+      _showSnack(error.toString());
+    }
+  }
+
   Future<void> _joinQueue() async {
     try {
       await _client.joinQueue();
