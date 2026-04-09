@@ -16,6 +16,7 @@ class Room {
     this.activeStudentId = null;
     this.activeStudentProducers = { audio: null, video: null };
     this.studentQueue = [];
+    this.reentryRequestQueue = [];
   }
 
   log(event, payload) {
@@ -135,6 +136,9 @@ class Room {
       name: peer.name,
       networkType: peer.networkType || 'unknown',
       isActiveSpeaker: peer.id === this.activeStudentId,
+      canSelfJoinQueue: peer.role === 'student' ? !peer.hasCompletedTurn : false,
+      hasPendingReentryRequest:
+        peer.role === 'student' ? this.reentryRequestQueue.includes(peer.id) : false,
       joinedAt: peer.joinedAt
     };
   }
@@ -156,6 +160,7 @@ class Room {
       teacherId: this.teacherId,
       activeStudentId: this.activeStudentId,
       queue: this.getQueueForClient(),
+      reentryRequests: this.getReentryRequestsForClient(),
       teacherProducers: { ...this.teacherProducers },
       activeStudentProducers: { ...this.activeStudentProducers }
     });
@@ -164,6 +169,7 @@ class Room {
   _broadcastQueue() {
     this.io.emit('queueUpdate', {
       queue: this.getQueueForClient(),
+      reentryRequests: this.getReentryRequestsForClient(),
       activeStudentId: this.activeStudentId
     });
   }
@@ -208,6 +214,22 @@ class Room {
     return true;
   }
 
+  _enqueueReentryRequest(peerId) {
+    if (!peerId || this.reentryRequestQueue.includes(peerId)) {
+      return;
+    }
+    this.reentryRequestQueue.push(peerId);
+  }
+
+  _removeReentryRequest(peerId) {
+    const index = this.reentryRequestQueue.indexOf(peerId);
+    if (index === -1) {
+      return false;
+    }
+    this.reentryRequestQueue.splice(index, 1);
+    return true;
+  }
+
   getQueueForClient() {
     const queue = [];
     for (const peerId of this.studentQueue) {
@@ -223,13 +245,34 @@ class Room {
     return queue;
   }
 
+  getReentryRequestsForClient() {
+    const requests = [];
+    for (const peerId of this.reentryRequestQueue) {
+      const peer = this.peers.get(peerId);
+      if (!peer || peer.role !== 'student') {
+        continue;
+      }
+      requests.push({
+        id: peer.id,
+        name: peer.name
+      });
+    }
+    return requests;
+  }
+
   async joinQueue(peerId) {
     const peer = this._getPeerOrThrow(peerId);
     if (peer.role !== 'student') {
       throw new Error('Only students can join queue');
     }
+    if (peer.hasCompletedTurn) {
+      throw new Error(
+        'Direct queue entry already used. Request re-entry and wait for teacher approval'
+      );
+    }
 
     peer.wantsQueue = true;
+    this._removeReentryRequest(peer.id);
     if (this.activeStudentId !== peer.id) {
       this._enqueueStudent(peer.id);
     }
@@ -239,6 +282,7 @@ class Room {
 
     return {
       queue: this.getQueueForClient(),
+      reentryRequests: this.getReentryRequestsForClient(),
       activeStudentId: this.activeStudentId
     };
   }
@@ -257,6 +301,75 @@ class Room {
 
     return {
       queue: this.getQueueForClient(),
+      reentryRequests: this.getReentryRequestsForClient(),
+      activeStudentId: this.activeStudentId
+    };
+  }
+
+  async requestQueueReentry(peerId) {
+    const peer = this._getPeerOrThrow(peerId);
+    if (peer.role !== 'student') {
+      throw new Error('Only students can request queue re-entry');
+    }
+    if (!peer.hasCompletedTurn) {
+      throw new Error('You can still use Join Queue directly');
+    }
+    if (this.activeStudentId === peer.id) {
+      throw new Error('You are already the active student');
+    }
+
+    peer.wantsQueue = true;
+    this._enqueueReentryRequest(peer.id);
+
+    this._broadcastPeers();
+    this._broadcastQueue();
+
+    return {
+      queue: this.getQueueForClient(),
+      reentryRequests: this.getReentryRequestsForClient(),
+      activeStudentId: this.activeStudentId
+    };
+  }
+
+  async approveQueueReentry(teacherPeerId, studentId) {
+    this._assertTeacher(teacherPeerId);
+
+    const requestedStudentId = studentId || this.reentryRequestQueue[0];
+    if (!requestedStudentId) {
+      throw new Error('No re-entry requests waiting');
+    }
+    if (this.reentryRequestQueue[0] !== requestedStudentId) {
+      throw new Error('Only the first re-entry request can be approved');
+    }
+
+    const studentPeer = this._getPeerOrThrow(requestedStudentId);
+    if (studentPeer.role !== 'student') {
+      throw new Error('approveQueueReentry target must be a student');
+    }
+    if (this.activeStudentId === requestedStudentId) {
+      throw new Error('Student is already active');
+    }
+
+    this._removeReentryRequest(requestedStudentId);
+    studentPeer.wantsQueue = true;
+    this._enqueueStudent(requestedStudentId);
+
+    studentPeer.socket.emit('queueReentryApproved', {
+      studentId: requestedStudentId,
+      approvedBy: teacherPeerId
+    });
+
+    this._broadcastPeers();
+    this._broadcastQueue();
+
+    this.log('approveQueueReentry', {
+      teacherPeerId,
+      studentId: requestedStudentId
+    });
+
+    return {
+      queue: this.getQueueForClient(),
+      reentryRequests: this.getReentryRequestsForClient(),
       activeStudentId: this.activeStudentId
     };
   }
@@ -297,7 +410,8 @@ class Room {
       transports: new Map(),
       producers: new Map(),
       consumers: new Map(),
-      wantsQueue: normalizedRole === 'student'
+      wantsQueue: normalizedRole === 'student',
+      hasCompletedTurn: false
     };
 
     this.peers.set(peer.id, peer);
@@ -328,6 +442,7 @@ class Room {
       teacherId: this.teacherId,
       activeStudentId: this.activeStudentId,
       queue: this.getQueueForClient(),
+      reentryRequests: this.getReentryRequestsForClient(),
       teacherProducers: { ...this.teacherProducers },
       activeStudentProducers: { ...this.activeStudentProducers }
     };
@@ -646,6 +761,8 @@ class Room {
     this.activeStudentProducers = { audio: null, video: null };
 
     if (studentPeer) {
+      studentPeer.hasCompletedTurn = true;
+      studentPeer.wantsQueue = false;
       const producerIds = Array.from(studentPeer.producers.keys());
       for (const producerId of producerIds) {
         await this.closeProducer(studentPeer.id, producerId, { emit: true, shouldClose: true });
@@ -655,13 +772,6 @@ class Room {
         studentId,
         reason
       });
-
-      const shouldRequeue =
-        (reason === 'ended_by_teacher' || reason === 'replaced_by_teacher') &&
-        studentPeer.wantsQueue;
-      if (shouldRequeue) {
-        this._enqueueStudent(studentPeer.id);
-      }
     }
 
     this.io.emit('activeStudentChanged', {
@@ -691,6 +801,7 @@ class Room {
     const isTeacher = this.teacherId === peerId;
     const isActiveStudent = this.activeStudentId === peerId;
     const wasQueued = this._removeFromQueue(peerId);
+    const hadReentryRequest = this._removeReentryRequest(peerId);
 
     const producerIds = Array.from(peer.producers.keys());
     for (const producerId of producerIds) {
@@ -731,7 +842,7 @@ class Room {
     }
 
     this._broadcastPeers();
-    if (wasQueued || isActiveStudent) {
+    if (wasQueued || hadReentryRequest || isActiveStudent) {
       this._broadcastQueue();
     }
   }
@@ -744,6 +855,8 @@ class Room {
       activeStudentId: this.activeStudentId,
       queueLength: this.studentQueue.length,
       queue: this.getQueueForClient(),
+      reentryRequestLength: this.reentryRequestQueue.length,
+      reentryRequests: this.getReentryRequestsForClient(),
       teacherProducers: { ...this.teacherProducers },
       activeStudentProducers: { ...this.activeStudentProducers },
       timestamp: new Date().toISOString()
@@ -781,6 +894,7 @@ class Room {
   getQueueState() {
     return {
       queue: this.getQueueForClient(),
+      reentryRequests: this.getReentryRequestsForClient(),
       activeStudentId: this.activeStudentId
     };
   }

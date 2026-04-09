@@ -259,6 +259,28 @@ async function bootstrap() {
       }
     });
 
+    socket.on('requestQueueReentry', async (payload = {}, ack) => {
+      log('requestQueueReentry', { socketId: socket.id, payload });
+      try {
+        const data = await room.requestQueueReentry(socket.id);
+        ackOk(ack, data);
+      } catch (error) {
+        log('requestQueueReentry error', { socketId: socket.id, error: error.message });
+        ackError(ack, error);
+      }
+    });
+
+    socket.on('approveQueueReentry', async (payload = {}, ack) => {
+      log('approveQueueReentry', { socketId: socket.id, payload });
+      try {
+        const data = await room.approveQueueReentry(socket.id, payload.studentId);
+        ackOk(ack, data);
+      } catch (error) {
+        log('approveQueueReentry error', { socketId: socket.id, error: error.message });
+        ackError(ack, error);
+      }
+    });
+
     socket.on('leaveQueue', async (payload = {}, ack) => {
       log('leaveQueue', { socketId: socket.id, payload });
       try {

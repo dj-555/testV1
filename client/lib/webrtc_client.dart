@@ -15,12 +15,16 @@ class PeerSummary {
   final String role;
   final String name;
   final bool isActiveSpeaker;
+  final bool canSelfJoinQueue;
+  final bool hasPendingReentryRequest;
 
   const PeerSummary({
     required this.id,
     required this.role,
     required this.name,
     required this.isActiveSpeaker,
+    required this.canSelfJoinQueue,
+    required this.hasPendingReentryRequest,
   });
 
   factory PeerSummary.fromMap(Map<String, dynamic> map) {
@@ -29,6 +33,8 @@ class PeerSummary {
       role: map['role']?.toString() ?? 'student',
       name: map['name']?.toString() ?? 'Unknown',
       isActiveSpeaker: map['isActiveSpeaker'] == true,
+      canSelfJoinQueue: map['canSelfJoinQueue'] != false,
+      hasPendingReentryRequest: map['hasPendingReentryRequest'] == true,
     );
   }
 }
@@ -83,6 +89,8 @@ class WebRtcClient {
   final ValueNotifier<String?> activeStudentIdNotifier =
       ValueNotifier<String?>(null);
   final ValueNotifier<List<QueueEntry>> queueNotifier =
+      ValueNotifier<List<QueueEntry>>(<QueueEntry>[]);
+  final ValueNotifier<List<QueueEntry>> reentryRequestsNotifier =
       ValueNotifier<List<QueueEntry>>(<QueueEntry>[]);
   final ValueNotifier<String> iceMethodNotifier =
       ValueNotifier<String>('not-detected');
@@ -192,6 +200,7 @@ class WebRtcClient {
     peersNotifier.dispose();
     activeStudentIdNotifier.dispose();
     queueNotifier.dispose();
+    reentryRequestsNotifier.dispose();
     iceMethodNotifier.dispose();
   }
 
@@ -226,6 +235,25 @@ class WebRtcClient {
       throw Exception('Teacher does not join queue');
     }
     await _signaling.request('joinQueue');
+  }
+
+  Future<void> requestQueueReentry() async {
+    if (isTeacher) {
+      throw Exception('Teacher does not request queue re-entry');
+    }
+    await _signaling.request('requestQueueReentry');
+  }
+
+  Future<void> approveQueueReentry([String? studentId]) async {
+    if (!isTeacher) {
+      throw Exception('Only teacher can approve queue re-entry requests');
+    }
+
+    final payload = <String, dynamic>{};
+    if (studentId != null && studentId.isNotEmpty) {
+      payload['studentId'] = studentId;
+    }
+    await _signaling.request('approveQueueReentry', payload);
   }
 
   Future<void> leaveQueue() async {
@@ -269,6 +297,7 @@ class WebRtcClient {
     _updatePeers(joinResponse['peers']);
     _absorbServerProducerState(joinResponse);
     final hasQueuePayload = _updateQueue(joinResponse['queue']);
+    _updateReentryRequests(joinResponse['reentryRequests']);
     if (!hasQueuePayload) {
       _rebuildQueueFromPeers();
     }
@@ -832,6 +861,7 @@ class WebRtcClient {
     _signaling.off('teacherDisconnected');
     _signaling.off('consumerClosed');
     _signaling.off('queueUpdate');
+    _signaling.off('queueReentryApproved');
 
     _signaling.on('newProducer', (dynamic data) async {
       final payload = _toMap(data);
@@ -914,6 +944,7 @@ class WebRtcClient {
       activeStudentIdNotifier.value = payload['activeStudentId']?.toString();
       _absorbServerProducerState(payload);
       final hasQueuePayload = _updateQueue(payload['queue']);
+      _updateReentryRequests(payload['reentryRequests']);
       if (!hasQueuePayload) {
         _rebuildQueueFromPeers();
       }
@@ -960,6 +991,7 @@ class WebRtcClient {
     _signaling.on('queueUpdate', (dynamic data) async {
       final payload = _toMap(data);
       final hasQueuePayload = _updateQueue(payload['queue']);
+      _updateReentryRequests(payload['reentryRequests']);
       if (!hasQueuePayload) {
         _rebuildQueueFromPeers();
       }
@@ -969,6 +1001,10 @@ class WebRtcClient {
           await _recoverStudentWatchStreams(reason: 'queueUpdate');
         }
       }
+    });
+
+    _signaling.on('queueReentryApproved', (dynamic data) {
+      debugPrint('[webrtc] queueReentryApproved payload=${_toMap(data)}');
     });
   }
 
@@ -1008,6 +1044,29 @@ class WebRtcClient {
     }
 
     queueNotifier.value = parsed;
+    return true;
+  }
+
+  bool _updateReentryRequests(dynamic requestsRaw) {
+    if (requestsRaw is! List) {
+      return false;
+    }
+
+    final parsed = <QueueEntry>[];
+    for (final dynamic item in requestsRaw) {
+      final map = _toMap(item);
+      if (map.isEmpty) {
+        final id = item?.toString() ?? '';
+        if (id.isEmpty) continue;
+        parsed.add(QueueEntry(id: id, name: 'Student'));
+        continue;
+      }
+      final entry = QueueEntry.fromMap(map);
+      if (entry.id.isEmpty) continue;
+      parsed.add(entry);
+    }
+
+    reentryRequestsNotifier.value = parsed;
     return true;
   }
 
@@ -1248,6 +1307,7 @@ class WebRtcClient {
     peersNotifier.value = <PeerSummary>[];
     activeStudentIdNotifier.value = null;
     queueNotifier.value = <QueueEntry>[];
+    reentryRequestsNotifier.value = <QueueEntry>[];
     iceMethodNotifier.value = 'not-detected';
 
     localStreamNotifier.value = null;
