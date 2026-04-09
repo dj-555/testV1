@@ -7,11 +7,12 @@
 
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:quran_live_class_client/main.dart';
+import 'package:quran_live_class_client/app.dart';
+import 'package:quran_live_class_client/quran_live_class_page.dart';
 
 void main() {
   testWidgets('App renders', (WidgetTester tester) async {
     await tester.pumpWidget(const QuranLiveClassApp());
-    expect(find.text('Quran Live Class'), findsWidgets);
+    expect(find.byType(QuranLiveClassPage), findsOneWidget);
   });
 }
