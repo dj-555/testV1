@@ -5,6 +5,9 @@ extension _QuranLiveClassPageTeacherWidgets on _QuranLiveClassPageState {
     final nextInQueue = _queue.isNotEmpty ? _queue.first : null;
     final firstReentryRequest =
         _reentryRequests.isNotEmpty ? _reentryRequests.first : null;
+    final approveQueueLabel =
+        _activeStudentId == null ? 'Approve First' : 'Approve Next';
+    final canEndLastTurn = _queue.isEmpty && _activeStudentId != null;
 
     return Card(
       color: Colors.white.withOpacity(0.95),
@@ -41,9 +44,23 @@ extension _QuranLiveClassPageTeacherWidgets on _QuranLiveClassPageState {
                 child: FilledButton.icon(
                   onPressed: _isConnected ? _approveNextInQueue : null,
                   icon: const Icon(Icons.play_arrow),
-                  label: const Text('Approve First'),
+                  label: Text(approveQueueLabel),
                 ),
               ),
+            if (canEndLastTurn) ...<Widget>[
+              const SizedBox(height: 10),
+              SizedBox(
+                width: double.infinity,
+                child: FilledButton.icon(
+                  onPressed: _isConnected ? _endLastStudentTurn : null,
+                  icon: const Icon(Icons.stop_circle_outlined),
+                  style: FilledButton.styleFrom(
+                    backgroundColor: Colors.red.shade500,
+                  ),
+                  label: const Text('End Last Student Turn'),
+                ),
+              ),
+            ],
             const SizedBox(height: 12),
             const Text(
               'Waiting Queue',
