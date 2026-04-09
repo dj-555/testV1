@@ -111,6 +111,7 @@ class WebRtcClient {
   final Map<String, ms.Consumer> _consumersById = <String, ms.Consumer>{};
   final Map<String, ms.Consumer> _consumersByProducerId =
       <String, ms.Consumer>{};
+  final Set<String> _pendingConsumeProducerIds = <String>{};
   final Map<String, Map<String, dynamic>> _consumerMetaById =
       <String, Map<String, dynamic>>{};
   final Map<String, Map<String, dynamic>> _producerMetaById =
@@ -152,6 +153,7 @@ class WebRtcClient {
     connectionState.value = 'connecting';
 
     await _resetMediaState(notifyServer: false);
+    await _configureAudioRouteForCall();
 
     await _signaling.connect(_serverUrl, socketPath: _socketPath);
     _registerServerEvents();
@@ -499,12 +501,13 @@ class WebRtcClient {
       'video': <String, dynamic>{
         'facingMode': 'user',
         'mandatory': <String, dynamic>{
+          // Keep student stream light enough for weaker devices/emulators.
           'minWidth': isStudent ? '320' : '640',
-          'minHeight': isStudent ? '180' : '360',
-          'maxWidth': isStudent ? '320' : '640',
-          'maxHeight': isStudent ? '180' : '360',
-          'minFrameRate': isStudent ? '10' : '15',
-          'maxFrameRate': isStudent ? '12' : '24',
+          'minHeight': isStudent ? '240' : '360',
+          'maxWidth': isStudent ? '640' : '1280',
+          'maxHeight': isStudent ? '480' : '720',
+          'minFrameRate': isStudent ? '12' : '15',
+          'maxFrameRate': isStudent ? '20' : '24',
         },
         'optional': <dynamic>[],
       },
@@ -565,6 +568,23 @@ class WebRtcClient {
     return cameraGranted && micGranted;
   }
 
+  Future<void> _configureAudioRouteForCall() async {
+    if (kIsWeb) return;
+
+    try {
+      await Helper.setSpeakerphoneOnButPreferBluetooth();
+      return;
+    } catch (_) {
+      // Fallback for plugin/platform variants.
+    }
+
+    try {
+      await Helper.setSpeakerphoneOn(true);
+    } catch (error) {
+      debugPrint('[webrtc] setSpeakerphoneOn failed: $error');
+    }
+  }
+
   Future<void> _consumeProducer(Map<String, dynamic> producerInfo) async {
     if (_recvTransport == null || _device == null) return;
 
@@ -594,6 +614,9 @@ class WebRtcClient {
     }
 
     if (_consumersByProducerId.containsKey(producerId)) {
+      return;
+    }
+    if (!_pendingConsumeProducerIds.add(producerId)) {
       return;
     }
 
@@ -650,12 +673,18 @@ class WebRtcClient {
       debugPrint('[webrtc] consume success producerId=$producerId');
     } catch (error) {
       debugPrint('[webrtc] consume failed producerId=$producerId error=$error');
+      _pendingConsumeProducerIds.remove(producerId);
+    } finally {
+      if (!_consumersByProducerId.containsKey(producerId)) {
+        _pendingConsumeProducerIds.remove(producerId);
+      }
     }
   }
 
   void _onConsumerCreated(ms.Consumer consumer, dynamic _) {
     _consumersById[consumer.id] = consumer;
     _consumersByProducerId[consumer.producerId] = consumer;
+    _pendingConsumeProducerIds.remove(consumer.producerId);
     _consumerMetaById[consumer.id] = _normalizeConsumerAppData(
       _consumerMetaById[consumer.id] ?? _toMap(consumer.appData),
       fallbackProducerId: consumer.producerId,
@@ -816,6 +845,7 @@ class WebRtcClient {
       final producerId = payload['producerId']?.toString();
       if (producerId == null) return;
       _producerMetaById.remove(producerId);
+      _pendingConsumeProducerIds.remove(producerId);
 
       final consumer = _consumersByProducerId.remove(producerId);
       if (consumer != null) {
@@ -1105,6 +1135,7 @@ class WebRtcClient {
     final consumers = _consumersById.values.toList(growable: false);
     _consumersById.clear();
     _consumersByProducerId.clear();
+    _pendingConsumeProducerIds.clear();
     _consumerMetaById.clear();
     _producerMetaById.clear();
 
